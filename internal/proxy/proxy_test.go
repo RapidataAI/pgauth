@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -19,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,6 +32,7 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/RapidataAI/pgauth/internal/config"
+	pgconnect "github.com/RapidataAI/pgauth/internal/connect"
 	"github.com/RapidataAI/pgauth/internal/token"
 )
 
@@ -378,9 +382,89 @@ func TestSweep(t *testing.T) {
 	_ = execAll(ctx, shared.adminDSN, []string{`DROP ROLE pgauth_busy`, `DROP ROLE pgauth_young`, `DROP ROLE pgauth_unmarked`})
 }
 
+type memStore map[string]string
+
+func (m memStore) Get(k string) (string, error) { return m[k], nil }
+func (m memStore) Set(k, v string) error        { m[k] = v; return nil }
+
+func TestConnector(t *testing.T) {
+	ctx := context.Background()
+	server := startServer(t, nil)
+	store := memStore{}
+	startConnector := func() string {
+		c, err := pgconnect.New(pgconnect.Options{
+			Issuer: shared.issuer.srv.URL, ClientID: "pgauth-cli", Resource: audience, Scope: "openid offline_access",
+			Server: server, ServerCA: shared.certFile, Store: store,
+			OpenBrowser: func(u string) error {
+				go func() {
+					if resp, err := http.Get(u); err == nil {
+						resp.Body.Close()
+					}
+				}()
+				return nil
+			},
+		}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cctx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() { defer close(done); _ = c.Serve(cctx, ln) }()
+		t.Cleanup(func() { cancel(); <-done })
+		return ln.Addr().String()
+	}
+	query := func(addr, db string) (string, error) {
+		host, port, _ := net.SplitHostPort(addr)
+		conn, err := pgx.Connect(ctx, fmt.Sprintf("host=%s port=%s dbname=%s user=me sslmode=prefer", host, port, db))
+		if err != nil {
+			return "", err
+		}
+		defer conn.Close(ctx)
+		var user string
+		err = conn.QueryRow(ctx, "SELECT current_user FROM items LIMIT 1").Scan(&user)
+		return user, err
+	}
+	counts := func() (int, int) {
+		shared.issuer.mu.Lock()
+		defer shared.issuer.mu.Unlock()
+		return shared.issuer.logins, shared.issuer.refreshes
+	}
+	logins0, refreshes0 := counts()
+
+	first := startConnector()
+	for range 2 {
+		if user, err := query(first, "cloudsql-main/order"); err != nil || !strings.HasPrefix(user, "pgauth_") {
+			t.Fatalf("query through connector: user %q, err %v", user, err)
+		}
+	}
+	if _, err := query(first, "cloudsql-main/assignment"); err == nil || !strings.Contains(err.Error(), "no grant") {
+		t.Fatalf("want pgauth's denial passed through, got %v", err)
+	}
+	if l, r := counts(); l-logins0 != 1 || r-refreshes0 != 0 {
+		t.Fatalf("first connector: %d logins, %d refreshes; want one login reused for every connection", l-logins0, r-refreshes0)
+	}
+
+	second := startConnector()
+	if _, err := query(second, "cloudsql-main/order"); err != nil {
+		t.Fatal(err)
+	}
+	if l, r := counts(); l-logins0 != 1 || r-refreshes0 != 1 {
+		t.Fatalf("second connector: %d logins, %d refreshes; want the stored refresh token used", l-logins0, r-refreshes0)
+	}
+}
+
 type issuer struct {
 	srv *httptest.Server
 	key *rsa.PrivateKey
+
+	mu         sync.Mutex
+	challenges map[string]string // code -> PKCE challenge
+	logins     int
+	refreshes  int
 }
 
 func newIssuer() *issuer {
@@ -388,7 +472,7 @@ func newIssuer() *issuer {
 	if err != nil {
 		panic(err)
 	}
-	is := &issuer{key: key}
+	is := &issuer{key: key, challenges: map[string]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -398,6 +482,38 @@ func newIssuer() *issuer {
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
+	})
+	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		code := rand.Text()
+		is.mu.Lock()
+		is.challenges[code] = q.Get("code_challenge")
+		is.mu.Unlock()
+		http.Redirect(w, r, q.Get("redirect_uri")+"?code="+code+"&state="+q.Get("state"), http.StatusFound)
+	})
+	mux.HandleFunc("POST /token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		is.mu.Lock()
+		defer is.mu.Unlock()
+		switch r.Form.Get("grant_type") {
+		case "authorization_code":
+			sum := sha256.Sum256([]byte(r.Form.Get("code_verifier")))
+			if is.challenges[r.Form.Get("code")] != base64.RawURLEncoding.EncodeToString(sum[:]) {
+				http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+				return
+			}
+			is.logins++
+		case "refresh_token":
+			if !strings.HasPrefix(r.Form.Get("refresh_token"), "refresh-") {
+				http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+				return
+			}
+			is.refreshes++
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  is.token(claims{roles: []string{"cloudsql-main/order:reader"}, client: r.Form.Get("client_id"), audience: r.Form.Get("resource")}),
+			"refresh_token": "refresh-" + rand.Text(), "expires_in": 3600, "token_type": "Bearer",
+		})
 	})
 	is.srv = httptest.NewServer(mux)
 	return is

@@ -111,6 +111,29 @@ shows no session of that role (another pod's); the startup sweep drops only `pga
 with no session that were created more than `sweepMinAge` (5 minutes) ago. A role whose last session
 closed on a pod that then crashed stays until some pod restarts and sweeps it.
 
+## Connecting as a person
+
+`pgauth connect` is the connector: it logs you in through the browser (authorization code + PKCE
+against a public OIDC client whose redirect URIs allow `http://127.0.0.1/*`), keeps the refresh token
+in the OS keychain (macOS Keychain, Secret Service on Linux), and listens on `127.0.0.1:5432`. Every
+connection a local client opens is forwarded to pgauth over TLS with a fresh token as the password.
+
+```
+pgauth connect --issuer https://auth.example.com --client-id pgauth-cli \
+  --resource https://postgres.example.com --scope "openid offline_access postgres:read" \
+  --server pgauth.example.com:5432 [--server-ca internal-ca.pem] [--listen 127.0.0.1:5432]
+psql "host=127.0.0.1 dbname=main/orders"
+```
+
+The flags can live in `connect.yaml` under your user config directory (`~/Library/Application
+Support/pgauth/` on macOS, `~/.config/pgauth/` on Linux) as `issuer`, `clientId`, `resource`, `scope`,
+`server`, `serverCA` and `listen`. Any process of yours that can reach the local port connects with
+your rights, the same trade-off as other local database proxies.
+
+Binaries for macOS (arm64, amd64) and Linux (amd64, arm64) are attached to each
+[GitHub release](https://github.com/RapidataAI/pgauth/releases). A binary downloaded with a browser
+on macOS is quarantined; download it with `curl` or run `xattr -d com.apple.quarantine pgauth`.
+
 ## Development
 
 ```
