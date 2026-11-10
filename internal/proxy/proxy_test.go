@@ -38,24 +38,21 @@ const (
 	rolesClaim   = "postgres:roles"
 )
 
-// setupSQL prepares an instance the way the README describes: group roles per database, the
-// marker group and an issuer login that holds ADMIN on them but none of their rights.
+// setupSQL prepares an instance with the README's required steps only, without the optional hardening.
 var setupSQL = []string{
 	`CREATE ROLE pgauth_temp NOLOGIN`,
 	`CREATE ROLE pgauth LOGIN PASSWORD 'issuer-secret' CREATEROLE`,
 	`GRANT pg_signal_backend TO pgauth`,
-	`GRANT pgauth_temp TO pgauth WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`,
+	`GRANT pgauth_temp TO pgauth WITH ADMIN OPTION`,
 }
 
 func setupDatabaseSQL(db string) []string {
 	return []string{
 		fmt.Sprintf(`CREATE DATABASE %q`, db),
-		fmt.Sprintf(`REVOKE CONNECT, TEMPORARY ON DATABASE %q FROM PUBLIC`, db),
 		fmt.Sprintf(`CREATE ROLE %s_service LOGIN`, db),
 		fmt.Sprintf(`CREATE ROLE %s_read NOLOGIN`, db),
 		fmt.Sprintf(`CREATE ROLE %s_write NOLOGIN`, db),
-		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %s_service, %s_read, %s_write`, db, db, db, db),
-		fmt.Sprintf(`GRANT %s_read, %s_write TO pgauth WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`, db, db),
+		fmt.Sprintf(`GRANT %s_read, %s_write TO pgauth WITH ADMIN OPTION`, db, db),
 	}
 }
 
