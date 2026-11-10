@@ -127,7 +127,8 @@ psql "host=127.0.0.1 dbname=main/orders"
 
 The flags can live in `connect.yaml` under your user config directory (`~/Library/Application
 Support/pgauth/` on macOS, `~/.config/pgauth/` on Linux) as `issuer`, `clientId`, `resource`, `scope`,
-`server`, `serverCA` and `listen`. Any process of yours that can reach the local port connects with
+`server`, `serverCA` and `listen`; see [`connect.example.yaml`](connect.example.yaml) and, for one
+real deployment, [`examples/rapidata-test/connect.yaml`](examples/rapidata-test/connect.yaml). Any process of yours that can reach the local port connects with
 your rights, the same trade-off as other local database proxies.
 
 Binaries for macOS (arm64, amd64) and Linux (amd64, arm64) are attached to each
