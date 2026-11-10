@@ -33,6 +33,7 @@ const usage = `pgauth: Postgres access with short-lived OIDC tokens
 
 Usage:
   pgauth serve --config <file>   run the proxy
+  pgauth connect [flags]         log in through the browser and serve localhost for Postgres clients
   pgauth version                 print the version
 `
 
@@ -45,6 +46,8 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		err = serve(os.Args[2:])
+	case "connect":
+		err = connectCmd(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
