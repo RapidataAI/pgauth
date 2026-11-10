@@ -45,7 +45,7 @@ Cancel requests work: pgauth hands the client its own cancel key and forwards ca
 
 ## Preparing an instance
 
-Run once per instance as a superuser (Cloud SQL: `cloudsqlsuperuser`), and once per database:
+Run once per instance as a superuser (Cloud SQL: a `cloudsqlsuperuser` member), and once per database:
 
 ```sql
 -- per instance
@@ -54,11 +54,9 @@ CREATE ROLE pgauth LOGIN PASSWORD '...' CREATEROLE;
 GRANT pg_signal_backend TO pgauth;
 GRANT pgauth_temp TO pgauth WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
 
--- per database <db>, owned by <db>_service
+-- per database <db>, whose tables are owned by <db>_service
 CREATE ROLE <db>_read NOLOGIN;
 CREATE ROLE <db>_write NOLOGIN;
-REVOKE CONNECT, TEMPORARY ON DATABASE <db> FROM PUBLIC;
-GRANT CONNECT ON DATABASE <db> TO <db>_service, <db>_read, <db>_write;
 GRANT <db>_read, <db>_write TO pgauth WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
 
 -- per database <db>, connected to <db>
@@ -72,9 +70,19 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO <db>_read;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO <db>_write;
 ```
 
-The issuer login `pgauth` can create roles and add them to these groups, but holds none of the
-groups' rights itself. Temporary roles get rights only through the groups, so `DROP ROLE` needs no
-per-database cleanup.
+pgauth needs only `ADMIN` on the groups. `INHERIT FALSE, SET FALSE` is the recommendation, so the issuer
+login holds none of the groups' rights itself, but it is optional: some tools (for example Terraform /
+OpenTofu Postgres providers) cannot express it, and plain `WITH ADMIN OPTION` works too. Temporary roles
+get rights only through the groups, so `DROP ROLE` needs no per-database cleanup.
+
+**Optional hardening.** pgauth only ever connects a temporary role to the database its token names, so
+this is not needed for pgauth to be safe. If no other login relies on `PUBLIC` having `CONNECT`, you can
+also keep temporary roles out of other databases at the Postgres level:
+
+```sql
+REVOKE CONNECT, TEMPORARY ON DATABASE <db> FROM PUBLIC;
+GRANT CONNECT ON DATABASE <db> TO <db>_service, <db>_read, <db>_write; -- plus every other login that uses <db>
+```
 
 ## Running
 
@@ -82,7 +90,9 @@ per-database cleanup.
 pgauth serve --config /etc/pgauth/config.yaml
 ```
 
-See [`config.example.yaml`](config.example.yaml) for every setting. The image
+See [`config.example.yaml`](config.example.yaml) for every setting. Upstream `sslmode` takes the libpq
+values; `require` encrypts without verifying the server certificate, `verify-ca` / `verify-full` with
+`sslrootcert` also verify it. The image
 `ghcr.io/rapidataai/pgauth:vX.Y.Z` runs as non-root and needs no writable filesystem.
 
 - **Health:** `GET /healthz` answers while the process runs; `GET /readyz` answers 200 once the
