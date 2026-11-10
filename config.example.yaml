@@ -1,0 +1,33 @@
+listen: ":5432"
+health: ":8080"            # GET /healthz (live), /readyz (keys loaded, every instance reachable as the issuer)
+
+tls:
+  certFile: /etc/pgauth/tls/tls.crt   # reread when the file changes
+  keyFile: /etc/pgauth/tls/tls.key
+
+oidc:
+  issuer: https://auth.example.com
+  audience: https://postgres.example.com
+  rolesClaim: postgres:roles         # entries "<instance>/<db>:<relation>"
+  clientIdClaim: client_id           # default; falls back to azp
+  allowedClients: []                 # empty allows any client
+
+# relation -> group role; {db} is the database name. This is the default.
+groups:
+  reader: "{db}_read"
+  writer: "{db}_write"
+
+tempGroup: pgauth_temp     # default
+rolePrefix: pgauth_        # default
+maxConnectionAge: 12h      # default
+sweepMinAge: 5m            # default; the startup sweep spares younger roles
+
+instances:
+  - name: main
+    host: 10.0.0.3
+    port: 5432
+    sslmode: verify-ca     # default verify-full
+    sslrootcert: /etc/pgauth/upstream-ca.pem
+    adminDatabase: postgres
+    databases: [orders, billing]
+    credentialsFile: /etc/pgauth/credentials/main.json   # {"username": "pgauth", "password": "..."}
