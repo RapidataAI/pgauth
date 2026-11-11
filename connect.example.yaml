@@ -6,3 +6,4 @@ scope: openid offline_access postgres:read
 server: pgauth.example.com:5432
 # serverCA: /path/to/internal-ca.pem   # only when pgauth's certificate is not signed by a public CA
 listen: 127.0.0.1:5432
+callbackPort: 8250     # login redirect http://127.0.0.1:8250/callback; 0 = any free port

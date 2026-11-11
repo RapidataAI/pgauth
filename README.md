@@ -164,7 +164,8 @@ closed on a pod that then crashed stays until some pod restarts and sweeps it.
 ## Connecting as a person
 
 `pgauth connect` is the connector: it logs you in through the browser (authorization code + PKCE
-against a public OIDC client whose redirect URIs allow `http://127.0.0.1/*`), keeps the refresh token
+against a public OIDC client; the redirect is `http://127.0.0.1:8250/callback`, set by
+`--callback-port`, and port 0 picks a free port for issuers that accept any loopback port per RFC 8252), keeps the refresh token
 in the OS keychain (macOS Keychain, Secret Service on Linux), and listens on `127.0.0.1:5432`. Every
 connection a local client opens is forwarded to pgauth over TLS with a fresh token as the password.
 
@@ -177,7 +178,7 @@ psql "host=127.0.0.1 dbname=main/orders"
 
 The flags can live in `connect.yaml` under your user config directory (`~/Library/Application
 Support/pgauth/` on macOS, `~/.config/pgauth/` on Linux) as `issuer`, `clientId`, `resource`, `scope`,
-`server`, `serverCA` and `listen`; see [`connect.example.yaml`](connect.example.yaml) and, for one
+`server`, `serverCA`, `listen` and `callbackPort`; see [`connect.example.yaml`](connect.example.yaml) and, for one
 real deployment, [`examples/rapidata-test/connect.yaml`](examples/rapidata-test/connect.yaml). Any process of yours that can reach the local port connects with
 your rights, the same trade-off as other local database proxies.
 

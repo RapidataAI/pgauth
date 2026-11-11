@@ -29,6 +29,8 @@ type Options struct {
 	Server   string
 	ServerCA string
 	Listen   string
+	// CallbackPort is the loopback port of the login redirect; 0 picks a free one (RFC 8252).
+	CallbackPort int
 	// OpenBrowser opens the login URL; the URL is also logged in case it fails.
 	OpenBrowser func(url string) error
 	Store       TokenStore

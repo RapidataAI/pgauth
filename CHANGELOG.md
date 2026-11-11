@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.1
+
+- `pgauth connect` redirects to a fixed `http://127.0.0.1:8250/callback` for issuers that need an exact redirect URI. `--callback-port` / `callbackPort` changes it; 0 restores the random port.
+
 ## v0.3.0
 
 pgauth now decides access itself from Kubernetes-style role bindings ([ADR 0007](docs/adr/0007-pgauth-decides-from-role-bindings.md)).

@@ -7,3 +7,4 @@ scope: openid offline_access postgres:read   # postgres:write for writes, if you
 server: pgauth.rabbitdata.internal:5432
 # serverCA: /path/to/rapidata-internal-ca.pem   # if the internal CA is not in your system trust store
 listen: 127.0.0.1:5432
+callbackPort: 8250     # login redirect http://127.0.0.1:8250/callback; 0 = any free port

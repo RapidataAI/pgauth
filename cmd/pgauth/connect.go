@@ -28,6 +28,8 @@ type connectFile struct {
 	Server   string `json:"server"`
 	ServerCA string `json:"serverCA"`
 	Listen   string `json:"listen"`
+	// CallbackPort is a pointer so an explicit 0 (random port) differs from unset.
+	CallbackPort *int `json:"callbackPort"`
 }
 
 func connectCmd(args []string) error {
@@ -44,6 +46,7 @@ func connectCmd(args []string) error {
 	server := fs.String("server", "", "pgauth address, host:port")
 	serverCA := fs.String("server-ca", "", "PEM file with the CA that signed pgauth's certificate (default: system roots)")
 	listen := fs.String("listen", "", `local address Postgres clients connect to (default "127.0.0.1:5432")`)
+	callbackPort := fs.Int("callback-port", defaultCallbackPort, "loopback port of the login redirect http://127.0.0.1:<port>/callback; 0 picks a free port")
 	_ = fs.Parse(args)
 
 	var f connectFile
@@ -64,15 +67,19 @@ func connectCmd(args []string) error {
 		return def
 	}
 	opts := connect.Options{
-		Issuer:      pick(*issuer, f.Issuer, ""),
-		ClientID:    pick(*clientID, f.ClientID, ""),
-		Resource:    pick(*resource, f.Resource, ""),
-		Scope:       pick(*scope, f.Scope, "openid offline_access"),
-		Server:      pick(*server, f.Server, ""),
-		ServerCA:    pick(*serverCA, f.ServerCA, ""),
-		Listen:      pick(*listen, f.Listen, "127.0.0.1:5432"),
-		OpenBrowser: openBrowser,
-		Store:       connect.Keychain{},
+		Issuer:       pick(*issuer, f.Issuer, ""),
+		ClientID:     pick(*clientID, f.ClientID, ""),
+		Resource:     pick(*resource, f.Resource, ""),
+		Scope:        pick(*scope, f.Scope, "openid offline_access"),
+		Server:       pick(*server, f.Server, ""),
+		ServerCA:     pick(*serverCA, f.ServerCA, ""),
+		Listen:       pick(*listen, f.Listen, "127.0.0.1:5432"),
+		CallbackPort: *callbackPort,
+		OpenBrowser:  openBrowser,
+		Store:        connect.Keychain{},
+	}
+	if f.CallbackPort != nil && !flagSet(fs, "callback-port") {
+		opts.CallbackPort = *f.CallbackPort
 	}
 	if opts.Issuer == "" || opts.ClientID == "" || opts.Server == "" {
 		return fmt.Errorf("--issuer, --client-id and --server are required (or set them in %s)", *path)
@@ -95,6 +102,14 @@ func connectCmd(args []string) error {
 	host, port, _ := net.SplitHostPort(ln.Addr().String())
 	log.Info("ready", "connect", fmt.Sprintf(`psql "host=%s port=%s dbname=<instance>/<db>"`, host, port))
 	return c.Serve(ctx, ln)
+}
+
+const defaultCallbackPort = 8250
+
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == name })
+	return set
 }
 
 func openBrowser(url string) error {
