@@ -20,8 +20,9 @@ type Config struct {
 	Health string `json:"health"`
 	TLS    TLS    `json:"tls"`
 	OIDC   OIDC   `json:"oidc"`
-	// Groups maps a relation from the roles claim to a group role; "{db}" is replaced by the database name.
-	Groups map[string]string `json:"groups"`
+	RBAC   RBAC   `json:"rbac"`
+	// GroupRoles names the Postgres group role per access level; "{db}" is replaced by the database name.
+	GroupRoles GroupRoles `json:"groupRoles"`
 	// TempGroup marks every temporary role so pgauth can find and sweep them.
 	TempGroup        string     `json:"tempGroup"`
 	RolePrefix       string     `json:"rolePrefix"`
@@ -35,14 +36,34 @@ type TLS struct {
 	KeyFile  string `json:"keyFile"`
 }
 
+type RBAC struct {
+	// Dir holds the PgRole / PgRoleBinding YAML; it is reread when it changes.
+	Dir            string   `json:"dir"`
+	ReloadInterval Duration `json:"reloadInterval"`
+}
+
+type GroupRoles struct {
+	Read  string `json:"read"`
+	Write string `json:"write"`
+}
+
 type OIDC struct {
-	Issuer   string `json:"issuer"`
-	Audience string `json:"audience"`
-	// RolesClaim holds entries "<instance>/<db>:<relation>", as a JSON array or a space-separated string.
-	RolesClaim    string `json:"rolesClaim"`
+	Issuer        string `json:"issuer"`
+	Audience      string `json:"audience"`
+	UsernameClaim string `json:"usernameClaim"`
+	GroupsClaim   string `json:"groupsClaim"`
+	// GroupsPrefix is prepended to every group from the token before bindings are matched.
+	GroupsPrefix  string `json:"groupsPrefix"`
+	Scopes        Scopes `json:"scopes"`
 	ClientIDClaim string `json:"clientIdClaim"`
 	// AllowedClients restricts the client a token was issued to; empty allows any.
 	AllowedClients []string `json:"allowedClients"`
+}
+
+// Scopes are the token scopes that cap access at read or allow write; a token with neither is refused.
+type Scopes struct {
+	Read  string `json:"read"`
+	Write string `json:"write"`
 }
 
 type Instance struct {
@@ -102,8 +123,26 @@ func (c *Config) ApplyDefaults() {
 	if c.OIDC.ClientIDClaim == "" {
 		c.OIDC.ClientIDClaim = "client_id"
 	}
-	if len(c.Groups) == 0 {
-		c.Groups = map[string]string{"reader": "{db}_read", "writer": "{db}_write"}
+	if c.OIDC.UsernameClaim == "" {
+		c.OIDC.UsernameClaim = "email"
+	}
+	if c.OIDC.GroupsClaim == "" {
+		c.OIDC.GroupsClaim = "groups"
+	}
+	if c.OIDC.Scopes.Read == "" {
+		c.OIDC.Scopes.Read = "postgres:read"
+	}
+	if c.OIDC.Scopes.Write == "" {
+		c.OIDC.Scopes.Write = "postgres:write"
+	}
+	if c.GroupRoles.Read == "" {
+		c.GroupRoles.Read = "{db}_read"
+	}
+	if c.GroupRoles.Write == "" {
+		c.GroupRoles.Write = "{db}_write"
+	}
+	if c.RBAC.ReloadInterval == 0 {
+		c.RBAC.ReloadInterval = Duration(10 * time.Second)
 	}
 	if c.TempGroup == "" {
 		c.TempGroup = "pgauth_temp"
@@ -142,7 +181,7 @@ func (c *Config) Validate() error {
 	req(c.TLS.KeyFile, "tls.keyFile")
 	req(c.OIDC.Issuer, "oidc.issuer")
 	req(c.OIDC.Audience, "oidc.audience")
-	req(c.OIDC.RolesClaim, "oidc.rolesClaim")
+	req(c.RBAC.Dir, "rbac.dir")
 	if len(c.Instances) == 0 {
 		errs = append(errs, errors.New("instances needs at least one entry"))
 	}
@@ -170,13 +209,22 @@ func (c *Config) Instance(name string) (Instance, bool) {
 	return Instance{}, false
 }
 
-// Group returns the group role for relation on db, or "" when the relation is not mapped.
-func (c *Config) Group(relation, db string) string {
-	tmpl, ok := c.Groups[relation]
-	if !ok {
-		return ""
+// GroupRole returns the group role for one level ("read" or "write") on db.
+func (c *Config) GroupRole(level, db string) string {
+	tmpl := c.GroupRoles.Read
+	if level == "write" {
+		tmpl = c.GroupRoles.Write
 	}
 	return strings.ReplaceAll(tmpl, "{db}", db)
+}
+
+// Databases maps every instance to the databases pgauth serves on it.
+func (c *Config) Databases() map[string][]string {
+	out := make(map[string][]string, len(c.Instances))
+	for _, in := range c.Instances {
+		out[in.Name] = in.Databases
+	}
+	return out
 }
 
 func (in Instance) Serves(db string) bool { return slices.Contains(in.Databases, db) }

@@ -33,13 +33,14 @@ import (
 
 	"github.com/RapidataAI/pgauth/internal/config"
 	pgconnect "github.com/RapidataAI/pgauth/internal/connect"
+	"github.com/RapidataAI/pgauth/internal/rbac"
 	"github.com/RapidataAI/pgauth/internal/token"
 )
 
 const (
 	instanceName = "cloudsql-main"
 	audience     = "https://postgres.example.test"
-	rolesClaim   = "postgres:roles"
+	defaultUser  = "mari@example.com"
 )
 
 // setupSQL prepares an instance with the README's required steps only, without the optional hardening.
@@ -159,15 +160,27 @@ func execAll(ctx context.Context, dsn string, stmts []string) error {
 	return nil
 }
 
-// startServer runs a pgauth against the shared Postgres and returns its address.
-func startServer(t *testing.T, mutate func(*config.Config)) string {
+// adminBinding gives the default user write on every database.
+const adminBinding = `
+apiVersion: pgauth.dev/v1alpha1
+kind: PgRoleBinding
+metadata: {name: default-admin}
+spec:
+  roleRef: {kind: PgRole, name: pg-admin}
+  subjects: [{kind: User, name: mari@example.com}]
+`
+
+// startServer runs a pgauth with adminBinding against the shared Postgres; the returned store
+// swaps the access rules.
+func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store) {
 	t.Helper()
 	cfg := &config.Config{
 		TLS: config.TLS{CertFile: shared.certFile, KeyFile: shared.keyFile},
 		OIDC: config.OIDC{
-			Issuer: shared.issuer.srv.URL, Audience: audience, RolesClaim: rolesClaim,
+			Issuer: shared.issuer.srv.URL, Audience: audience,
 			AllowedClients: []string{"poseidon-session", "pgauth-cli"},
 		},
+		RBAC: config.RBAC{Dir: "unused-in-tests"},
 		Instances: []config.Instance{{
 			Name: instanceName, Host: shared.host, Port: shared.port, SSLMode: "disable",
 			Databases: []string{"order", "assignment"}, CredentialsFile: shared.credFile,
@@ -188,7 +201,11 @@ func startServer(t *testing.T, mutate func(*config.Config)) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, verifier, &tls.Config{Certificates: []tls.Certificate{cert}}, log)
+	store := rbac.NewStore(cfg.Databases(), log)
+	if err := store.Update([]rbac.File{{Name: "admin.yaml", Data: []byte(adminBinding)}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(cfg, verifier, store, &tls.Config{Certificates: []tls.Certificate{cert}}, log)
 	srv.Start(ctx)
 	deadline := time.Now().Add(10 * time.Second)
 	for srv.Ready(ctx) != nil {
@@ -210,11 +227,13 @@ func startServer(t *testing.T, mutate func(*config.Config)) string {
 		cancel()
 		<-done
 	})
-	return ln.Addr().String()
+	return ln.Addr().String(), store
 }
 
 type claims struct {
-	roles    []string
+	user     string // default defaultUser
+	groups   []string
+	scope    string // default "postgres:read"
 	client   string
 	audience string
 	expired  bool
@@ -230,38 +249,72 @@ func connect(ctx context.Context, addr, db string, c claims) (*pgx.Conn, error) 
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
+func binding(name, role string, subjects ...string) string {
+	return fmt.Sprintf("---\napiVersion: pgauth.dev/v1alpha1\nkind: PgRoleBinding\nmetadata: {name: %s}\nspec:\n  roleRef: {kind: PgRole, name: %s}\n  subjects: [%s]\n",
+		name, role, strings.Join(subjects, ", "))
+}
+
+func user(name string) string  { return "{kind: User, name: " + name + "}" }
+func group(name string) string { return "{kind: Group, name: " + name + "}" }
+
+const analystRole = `
+apiVersion: pgauth.dev/v1alpha1
+kind: PgRole
+metadata: {name: analyst}
+spec:
+  grants:
+    - {instance: cloudsql-main, database: "*", level: read}
+`
+
 func TestConnect(t *testing.T) {
-	addr := startServer(t, nil)
-	reader := []string{"cloudsql-main/order:reader"}
-	writer := []string{"cloudsql-main/order:reader", "cloudsql-main/order:writer"}
+	addr, store := startServer(t, nil)
+	var (
+		mariOrderRead  = binding("mari-order", "cloudsql-main.order.read", user(defaultUser))
+		mariOrderWrite = binding("mari-order", "cloudsql-main.order.write", user(defaultUser))
+		admins         = binding("admins", "pg-admin", group("postgres-admins"))
+		readers        = binding("readers", "pg-reader", group("postgres-admins"))
+		analysts       = analystRole + binding("analysts", "analyst", group("analysts"))
+		admin          = []string{"postgres-admins"}
+	)
 	tests := []struct {
 		name        string
 		claims      claims
+		bindings    string
 		db          string
 		stmt        string
 		wantConnect bool
 		wantStmt    bool
 	}{
-		{"reader selects", claims{roles: reader}, "cloudsql-main/order", "SELECT count(*) FROM items", true, true},
-		{"reader cannot insert", claims{roles: reader}, "cloudsql-main/order", "INSERT INTO items VALUES (2)", true, false},
-		{"reader cannot switch to the write group", claims{roles: reader}, "cloudsql-main/order", "SET ROLE order_write", true, false},
-		{"writer inserts", claims{roles: writer}, "cloudsql-main/order", "INSERT INTO items VALUES (3)", true, true},
-		{"writer-only claim inserts", claims{roles: []string{"cloudsql-main/order:writer"}}, "cloudsql-main/order", "UPDATE items SET id = id", true, true},
-		{"writer cannot create tables", claims{roles: writer}, "cloudsql-main/order", "CREATE TABLE t (id int)", true, false},
-		{"writer cannot drop tables", claims{roles: writer}, "cloudsql-main/order", "DROP TABLE items", true, false},
-		{"grant on one database does not open another", claims{roles: reader}, "cloudsql-main/assignment", "", false, false},
-		{"pgauth-cli client is allowed", claims{roles: reader, client: "pgauth-cli"}, "cloudsql-main/order", "SELECT 1", true, true},
-		{"client outside the allowlist", claims{roles: reader, client: "other-app"}, "cloudsql-main/order", "", false, false},
-		{"expired token", claims{roles: reader, expired: true}, "cloudsql-main/order", "", false, false},
-		{"token for another audience", claims{roles: reader, audience: "https://api.example.test"}, "cloudsql-main/order", "", false, false},
-		{"unknown instance", claims{roles: []string{"other/order:reader"}}, "other/order", "", false, false},
-		{"database not served", claims{roles: []string{"cloudsql-main/postgres:reader"}}, "cloudsql-main/postgres", "", false, false},
-		{"database without instance", claims{roles: reader}, "order", "", false, false},
-		{"unmapped relation", claims{roles: []string{"cloudsql-main/order:owner"}}, "cloudsql-main/order", "", false, false},
+		{"user binding reads", claims{}, mariOrderRead, "cloudsql-main/order", "SELECT count(*) FROM items", true, true},
+		{"read binding cannot insert", claims{scope: "postgres:write"}, mariOrderRead, "cloudsql-main/order", "INSERT INTO items VALUES (2)", true, false},
+		{"read binding cannot switch to the write group", claims{}, mariOrderRead, "cloudsql-main/order", "SET ROLE order_write", true, false},
+		{"binding on one database does not open another", claims{}, mariOrderRead, "cloudsql-main/assignment", "", false, false},
+		{"user names match exactly", claims{user: "Mari@example.com"}, mariOrderRead, "cloudsql-main/order", "", false, false},
+		{"write binding with write scope updates", claims{scope: "postgres:write"}, mariOrderWrite, "cloudsql-main/order", "UPDATE items SET id = id", true, true},
+		{"write binding still reads", claims{scope: "postgres:write"}, mariOrderWrite, "cloudsql-main/order", "SELECT count(*) FROM items", true, true},
+		{"group pg-admin inserts with write scope", claims{user: "ada@example.com", groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/assignment", "INSERT INTO items VALUES (3)", true, true},
+		{"read scope caps pg-admin at read", claims{user: "ada@example.com", groups: admin, scope: "openid postgres:read"}, admins, "cloudsql-main/order", "INSERT INTO items VALUES (4)", true, false},
+		{"no postgres scope is refused", claims{user: "ada@example.com", groups: admin, scope: "openid"}, admins, "cloudsql-main/order", "", false, false},
+		{"pg-admin cannot create tables", claims{groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/order", "CREATE TABLE t (id int)", true, false},
+		{"pg-admin cannot drop tables", claims{groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/order", "DROP TABLE items", true, false},
+		{"pg-reader with write scope stays read", claims{groups: admin, scope: "postgres:write"}, readers, "cloudsql-main/order", "DELETE FROM items", true, false},
+		{"union of bindings takes the highest level", claims{groups: admin, scope: "postgres:write"}, readers + mariOrderWrite, "cloudsql-main/order", "UPDATE items SET id = id", true, true},
+		{"custom role with database * reads every database", claims{user: "bo@example.com", groups: []string{"analysts"}}, analysts, "cloudsql-main/assignment", "SELECT count(*) FROM items", true, true},
+		{"other group matches nothing", claims{user: "bo@example.com", groups: []string{"interns"}}, admins + analysts, "cloudsql-main/order", "", false, false},
+		{"pgauth-cli client is allowed", claims{client: "pgauth-cli"}, mariOrderRead, "cloudsql-main/order", "SELECT 1", true, true},
+		{"client outside the allowlist", claims{client: "other-app"}, mariOrderRead, "cloudsql-main/order", "", false, false},
+		{"expired token", claims{expired: true}, mariOrderRead, "cloudsql-main/order", "", false, false},
+		{"token for another audience", claims{audience: "https://api.example.test"}, mariOrderRead, "cloudsql-main/order", "", false, false},
+		{"unknown instance", claims{groups: admin}, admins, "other/order", "", false, false},
+		{"database not served", claims{groups: admin}, admins, "cloudsql-main/postgres", "", false, false},
+		{"database without instance", claims{groups: admin}, admins, "order", "", false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
+			if err := store.Update([]rbac.File{{Name: "row.yaml", Data: []byte(tt.bindings)}}); err != nil {
+				t.Fatalf("bindings: %v", err)
+			}
 			conn, err := connect(ctx, addr, tt.db, tt.claims)
 			if (err == nil) != tt.wantConnect {
 				t.Fatalf("connect error = %v, want connect %v", err, tt.wantConnect)
@@ -303,10 +356,10 @@ func TestReleaseDropsRole(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
-	c := claims{roles: []string{"cloudsql-main/order:reader"}}
+	c := claims{}
 
 	t.Run("last close drops the role", func(t *testing.T) {
-		addr := startServer(t, nil)
+		addr, _ := startServer(t, nil)
 		a, err := connect(ctx, addr, "cloudsql-main/order", c)
 		if err != nil {
 			t.Fatal(err)
@@ -329,7 +382,7 @@ func TestReleaseDropsRole(t *testing.T) {
 	})
 
 	t.Run("max connection age closes and drops", func(t *testing.T) {
-		addr := startServer(t, func(cfg *config.Config) { cfg.MaxConnectionAge = config.Duration(300 * time.Millisecond) })
+		addr, _ := startServer(t, func(cfg *config.Config) { cfg.MaxConnectionAge = config.Duration(300 * time.Millisecond) })
 		conn, err := connect(ctx, addr, "cloudsql-main/order", c)
 		if err != nil {
 			t.Fatal(err)
@@ -389,7 +442,7 @@ func (m memStore) Set(k, v string) error        { m[k] = v; return nil }
 
 func TestConnector(t *testing.T) {
 	ctx := context.Background()
-	server := startServer(t, nil)
+	server, _ := startServer(t, nil)
 	store := memStore{}
 	startConnector := func() string {
 		c, err := pgconnect.New(pgconnect.Options{
@@ -441,7 +494,7 @@ func TestConnector(t *testing.T) {
 			t.Fatalf("query through connector: user %q, err %v", user, err)
 		}
 	}
-	if _, err := query(first, "cloudsql-main/assignment"); err == nil || !strings.Contains(err.Error(), "no grant") {
+	if _, err := query(first, "cloudsql-main/postgres"); err == nil || !strings.Contains(err.Error(), "not served") {
 		t.Fatalf("want pgauth's denial passed through, got %v", err)
 	}
 	if l, r := counts(); l-logins0 != 1 || r-refreshes0 != 0 {
@@ -511,7 +564,7 @@ func newIssuer() *issuer {
 			is.refreshes++
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"access_token":  is.token(claims{roles: []string{"cloudsql-main/order:reader"}, client: r.Form.Get("client_id"), audience: r.Form.Get("resource")}),
+			"access_token":  is.token(claims{client: r.Form.Get("client_id"), audience: r.Form.Get("resource")}),
 			"refresh_token": "refresh-" + rand.Text(), "expires_in": 3600, "token_type": "Bearer",
 		})
 	})
@@ -530,13 +583,20 @@ func (is *issuer) token(c claims) string {
 	if c.audience == "" {
 		c.audience = audience
 	}
+	if c.user == "" {
+		c.user = defaultUser
+	}
+	if c.scope == "" {
+		c.scope = "postgres:read"
+	}
 	exp := time.Now().Add(15 * time.Minute)
 	if c.expired {
 		exp = time.Now().Add(-time.Minute)
 	}
 	raw, err := jwt.Signed(signer).Claims(map[string]any{
 		"iss": is.srv.URL, "sub": "user-1234567890", "aud": c.audience, "client_id": c.client,
-		"exp": exp.Unix(), "iat": time.Now().Add(-time.Hour).Unix(), rolesClaim: c.roles,
+		"exp": exp.Unix(), "iat": time.Now().Add(-time.Hour).Unix(),
+		"email": c.user, "groups": c.groups, "scope": c.scope,
 	}).Serialize()
 	if err != nil {
 		panic(err)

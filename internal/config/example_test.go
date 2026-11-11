@@ -7,7 +7,7 @@ func TestExampleLoads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Instances[0].Port != 5432 || c.Group("reader", "orders") != "orders_read" {
+	if c.Instances[0].Port != 5432 || c.GroupRole("read", "orders") != "orders_read" || c.OIDC.UsernameClaim != "email" {
 		t.Fatalf("%+v", c)
 	}
 }
