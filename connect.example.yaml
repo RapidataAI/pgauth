@@ -1,0 +1,8 @@
+# Defaults for `pgauth connect`; put this in <user config dir>/pgauth/connect.yaml. Flags override it.
+issuer: https://auth.example.com/
+clientId: pgauth-cli
+resource: https://postgres.example.com
+scope: openid offline_access postgres:read
+server: pgauth.example.com:5432
+# serverCA: /path/to/internal-ca.pem   # only when pgauth's certificate is not signed by a public CA
+listen: 127.0.0.1:5432
