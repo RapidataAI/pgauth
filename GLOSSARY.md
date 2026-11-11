@@ -1,19 +1,23 @@
 # pgauth
 
-Scoped access to Rapidata's Postgres databases: who may read or write which database, decided in OpenFGA and enforced by pgauth.
+Scoped access to Rapidata's Postgres databases: who may read or write which database, decided and enforced by pgauth from role bindings.
 
 ## Language
 
 **Database grant**:
-The right of one identity-service account to read (`reader`) or write (`writer`) one Postgres database or a whole instance, set by a platform admin. Any account can hold one, not only staff.
+The right to read or write one Postgres database or a whole instance, written as a grant of a `PgRole`. Any account can be bound to one, not only staff.
 _Avoid_: permission, access right, ACL
 
+**Role binding**:
+A `PgRoleBinding` that gives one `PgRole`'s database grants to users and groups named in the token.
+_Avoid_: assignment, membership
+
 **Database scope**:
-The OAuth scope `postgres:read` or `postgres:write` a token was issued with; it caps the database grants a token may carry. Vessels hold `postgres:read`; `postgres:write` is only issued inside an approved write run.
+The OAuth scope `postgres:read` or `postgres:write` a token was issued with; pgauth caps the access from role bindings by it. Vessels hold `postgres:read`; `postgres:write` is only issued inside an approved write run.
 _Avoid_: agent ceiling, agent limit
 
 **Database token**:
-A short-lived token whose `postgres:roles` claim lists `<instance>/<db>:reader|writer`: the holder's database grants, capped by its database scope.
+A short-lived token for the Postgres audience that proves who the holder is (user and groups) and carries a database scope; it lists no grants.
 _Avoid_: JWT, access token, credential
 
 **pgauth**:

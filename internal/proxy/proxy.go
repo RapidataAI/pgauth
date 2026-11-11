@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/RapidataAI/pgauth/internal/config"
+	"github.com/RapidataAI/pgauth/internal/rbac"
 	"github.com/RapidataAI/pgauth/internal/roles"
 	"github.com/RapidataAI/pgauth/internal/token"
 )
@@ -37,6 +38,7 @@ const handshakeTimeout = 30 * time.Second
 type Server struct {
 	cfg      *config.Config
 	verifier *token.Verifier
+	rbac     *rbac.Store
 	tls      *tls.Config
 	log      *slog.Logger
 	tracer   trace.Tracer
@@ -59,10 +61,11 @@ type cancelTarget struct {
 	upstream *pgconn.HijackedConn
 }
 
-func New(cfg *config.Config, verifier *token.Verifier, tlsConfig *tls.Config, log *slog.Logger) *Server {
+func New(cfg *config.Config, verifier *token.Verifier, store *rbac.Store, tlsConfig *tls.Config, log *slog.Logger) *Server {
 	s := &Server{
 		cfg:       cfg,
 		verifier:  verifier,
+		rbac:      store,
 		tls:       tlsConfig,
 		log:       log,
 		tracer:    otel.Tracer("github.com/RapidataAI/pgauth"),
@@ -121,10 +124,17 @@ func (s *Server) startInstance(ctx context.Context, in *instance) error {
 	return nil
 }
 
-// Ready reports whether the issuer's keys are loaded and every instance accepts the issuer login.
+// Ready reports whether the issuer's keys and a valid set of access rules are loaded and every
+// instance accepts the issuer login.
 func (s *Server) Ready(ctx context.Context) error {
 	if !s.verifier.Ready() {
 		return errors.New("oidc keys not loaded")
+	}
+	if st := s.rbac.Status(); !st.Loaded {
+		if st.Rejected != nil {
+			return fmt.Errorf("no valid access rules loaded: %w", st.Rejected)
+		}
+		return errors.New("access rules not loaded")
 	}
 	for name, in := range s.instances {
 		if !in.ready.Load() {
@@ -206,8 +216,9 @@ func (s *Server) handle(raw net.Conn) {
 
 // attempt collects what one connection attempt logs and records on its span.
 type attempt struct {
-	sub, clientID, instance, db, role string
-	roles                             []string
+	sub, user, clientID, instance, db, role string
+	groups, bindings                        []string
+	level, scopeCap                         string
 }
 
 func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgproto3.StartupMessage) {
@@ -218,10 +229,14 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 		d := time.Since(start)
 		span.SetAttributes(
 			attribute.String("pgauth.sub", a.sub),
+			attribute.String("pgauth.user", a.user),
+			attribute.StringSlice("pgauth.groups", a.groups),
 			attribute.String("pgauth.client_id", a.clientID),
 			attribute.String("pgauth.instance", a.instance),
 			attribute.String("db.namespace", a.db),
-			attribute.StringSlice("pgauth.roles", a.roles),
+			attribute.StringSlice("pgauth.bindings", a.bindings),
+			attribute.String("pgauth.level", a.level),
+			attribute.String("pgauth.scope_cap", a.scopeCap),
 			attribute.String("pgauth.decision", decision),
 			attribute.String("pgauth.reason", reason),
 			attribute.String("pgauth.role", a.role),
@@ -230,8 +245,9 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 			span.SetStatus(codes.Error, reason)
 		}
 		span.End()
-		s.log.Info("connect", "sub", a.sub, "client_id", a.clientID, "instance", a.instance, "db", a.db,
-			"roles", a.roles, "decision", decision, "reason", reason, "role", a.role, "duration_ms", d.Milliseconds())
+		s.log.Info("connect", "sub", a.sub, "user", a.user, "groups", a.groups, "client_id", a.clientID,
+			"instance", a.instance, "db", a.db, "bindings", a.bindings, "level", a.level, "scope_cap", a.scopeCap,
+			"decision", decision, "reason", reason, "role", a.role, "duration_ms", d.Milliseconds())
 	}
 
 	var dbOK bool
@@ -270,17 +286,20 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 		fail(backend, "28P01", "pgauth: "+err.Error())
 		return
 	}
-	a.sub, a.clientID = claims.Subject, claims.ClientID
+	a.sub, a.user, a.groups, a.clientID = claims.Subject, claims.Username, claims.Groups, claims.ClientID
 
-	in, granted, groups, reason := s.authorize(claims, a.instance, a.db)
-	a.roles = granted
+	in, d, reason := s.authorize(claims, a.instance, a.db)
+	a.bindings, a.level, a.scopeCap = d.bindings, d.level.String(), d.scopeCap.String()
 	if reason != "" {
 		finish("deny", reason)
 		fail(backend, "28000", "pgauth: "+reason)
 		return
 	}
 
-	spec := roles.Spec{Subject: claims.Subject, ClientID: claims.ClientID, Roles: granted, Groups: groups}
+	spec := roles.Spec{
+		Subject: claims.Subject, Username: claims.Username, ClientID: claims.ClientID,
+		Roles: []string{a.instance + "/" + a.db + ":" + d.level.String()}, Groups: d.groupRoles,
+	}
 	var upstream *pgconn.HijackedConn
 	role, pid, err := in.roles.Acquire(ctx, spec, func(role, password string) (uint32, error) {
 		up, err := s.dial(ctx, in.cfg, role, password, a.db, startup.Parameters)
@@ -315,38 +334,51 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 	splice(conn, upstream.Conn, time.Duration(s.cfg.MaxConnectionAge), s.stopping)
 }
 
-// authorize returns the claim entries granting access to instance/db and the group roles they map to,
-// or a reason to deny.
-func (s *Server) authorize(claims token.Claims, instName, db string) (in *instance, granted, groups []string, reason string) {
+type decision struct {
+	bindings   []string
+	level      rbac.Level // after the scope cap
+	scopeCap   rbac.Level
+	groupRoles []string
+}
+
+// authorize decides the access level on instance/db from the role bindings, capped by the token's
+// scope, or returns a reason to deny.
+func (s *Server) authorize(claims token.Claims, instName, db string) (*instance, decision, string) {
+	var d decision
 	in, ok := s.instances[instName]
 	if !ok {
-		return nil, nil, nil, fmt.Sprintf("unknown instance %q", instName)
+		return nil, d, fmt.Sprintf("unknown instance %q", instName)
 	}
 	if !in.cfg.Serves(db) {
-		return nil, nil, nil, fmt.Sprintf("database %s/%s is not served", instName, db)
+		return nil, d, fmt.Sprintf("database %s/%s is not served", instName, db)
 	}
 	if !in.ready.Load() {
-		return nil, nil, nil, fmt.Sprintf("instance %s is not ready", instName)
+		return nil, d, fmt.Sprintf("instance %s is not ready", instName)
 	}
-	for _, r := range claims.Roles {
-		target, relation, ok := strings.Cut(r, ":")
-		if !ok || target != instName+"/"+db {
-			continue
-		}
-		g := s.cfg.Group(relation, db)
-		if g == "" {
-			continue
-		}
-		granted = append(granted, r)
-		if !slices.Contains(groups, g) {
-			groups = append(groups, g)
-		}
+	policy := s.rbac.Policy()
+	if policy == nil {
+		return nil, d, "access rules are not loaded"
 	}
-	if len(groups) == 0 {
-		return nil, nil, nil, fmt.Sprintf("no grant for %s/%s", instName, db)
+	var granted rbac.Level
+	granted, d.bindings = policy.Access(claims.Username, claims.Groups, instName, db)
+	switch {
+	case slices.Contains(claims.Scopes, s.cfg.OIDC.Scopes.Write):
+		d.scopeCap = rbac.Write
+	case slices.Contains(claims.Scopes, s.cfg.OIDC.Scopes.Read):
+		d.scopeCap = rbac.Read
 	}
-	slices.Sort(granted)
-	return in, granted, groups, ""
+	d.level = min(granted, d.scopeCap)
+	switch {
+	case granted == rbac.None:
+		return nil, d, fmt.Sprintf("no role binding grants %s access to %s/%s", claims.Username, instName, db)
+	case d.scopeCap == rbac.None:
+		return nil, d, fmt.Sprintf("token has neither the %s nor the %s scope", s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)
+	}
+	d.groupRoles = []string{s.cfg.GroupRole("read", db)}
+	if d.level == rbac.Write {
+		d.groupRoles = append(d.groupRoles, s.cfg.GroupRole("write", db))
+	}
+	return in, d, ""
 }
 
 func (s *Server) dial(ctx context.Context, in config.Instance, role, password, db string, params map[string]string) (*pgconn.HijackedConn, error) {

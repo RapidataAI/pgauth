@@ -26,6 +26,7 @@ import (
 // Spec describes the temporary role one holder needs for one set of rights.
 type Spec struct {
 	Subject  string
+	Username string
 	ClientID string
 	// Roles are the claim entries that granted access; they decide the name.
 	Roles  []string
@@ -55,6 +56,7 @@ func (s Spec) key() string {
 
 type comment struct {
 	Subject  string    `json:"sub"`
+	Username string    `json:"user,omitempty"`
 	ClientID string    `json:"client"`
 	Created  time.Time `json:"created"`
 }
@@ -182,7 +184,7 @@ func (m *Manager) ensure(ctx context.Context, conn *pgxpool.Conn, role string, s
 	for i, g := range groups {
 		quoted[i] = pgx.Identifier{g}.Sanitize()
 	}
-	c, err := json.Marshal(comment{Subject: spec.Subject, ClientID: spec.ClientID, Created: time.Now().UTC()})
+	c, err := json.Marshal(comment{Subject: spec.Subject, Username: spec.Username, ClientID: spec.ClientID, Created: time.Now().UTC()})
 	if err != nil {
 		return err
 	}

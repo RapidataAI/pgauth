@@ -1,0 +1,10 @@
+# Mount the ConfigMap at the serve config's rbac.dir (e.g. /etc/pgauth/rbac). Without a name hash
+# the ConfigMap is updated in place, and pgauth reloads it without a restart.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: pgauth-rbac
+    files:
+      - bindings.yaml
+    options:
+      disableNameSuffixHash: true

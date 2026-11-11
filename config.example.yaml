@@ -8,14 +8,23 @@ tls:
 oidc:
   issuer: https://auth.example.com
   audience: https://postgres.example.com
-  rolesClaim: postgres:roles         # entries "<instance>/<db>:<relation>"
+  usernameClaim: email               # default; matched by `kind: User` subjects
+  groupsClaim: groups                # default; matched by `kind: Group` subjects
+  groupsPrefix: ""                   # default; prepended to every group from the token
+  scopes:                            # defaults; a token with neither scope is refused
+    read: postgres:read              #   caps access at read
+    write: postgres:write            #   allows write where a binding grants it
   clientIdClaim: client_id           # default; falls back to azp
   allowedClients: []                 # empty allows any client
 
-# relation -> group role; {db} is the database name. This is the default.
-groups:
-  reader: "{db}_read"
-  writer: "{db}_write"
+rbac:
+  dir: /etc/pgauth/rbac              # PgRole / PgRoleBinding YAML, reread on change
+  reloadInterval: 10s                # default
+
+# Postgres group role per access level; {db} is the database name. These are the defaults.
+groupRoles:
+  read: "{db}_read"
+  write: "{db}_write"
 
 tempGroup: pgauth_temp     # default
 rolePrefix: pgauth_        # default

@@ -20,8 +20,10 @@ import (
 type Claims struct {
 	Subject  string
 	ClientID string
-	// Roles are the raw entries of the roles claim, e.g. "main/order:reader".
-	Roles []string
+	Username string
+	// Groups carry the configured prefix.
+	Groups []string
+	Scopes []string
 }
 
 type Verifier struct {
@@ -104,9 +106,23 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	if len(v.cfg.AllowedClients) > 0 && !slices.Contains(v.cfg.AllowedClients, c.ClientID) {
 		return Claims{}, fmt.Errorf("%w: client %q is not allowed", ErrDenied, c.ClientID)
 	}
-	c.Roles, err = stringList(all[v.cfg.RolesClaim])
+	c.Username, _ = all[v.cfg.UsernameClaim].(string)
+	if c.Username == "" {
+		return Claims{}, fmt.Errorf("%w: no %s claim", ErrDenied, v.cfg.UsernameClaim)
+	}
+	groups, err := stringList(all[v.cfg.GroupsClaim])
 	if err != nil {
-		return Claims{}, fmt.Errorf("%w: claim %s: %v", ErrDenied, v.cfg.RolesClaim, err)
+		return Claims{}, fmt.Errorf("%w: claim %s: %v", ErrDenied, v.cfg.GroupsClaim, err)
+	}
+	for _, g := range groups {
+		c.Groups = append(c.Groups, v.cfg.GroupsPrefix+g)
+	}
+	scope := all["scope"]
+	if scope == nil {
+		scope = all["scp"]
+	}
+	if c.Scopes, err = stringList(scope); err != nil {
+		return Claims{}, fmt.Errorf("%w: claim scope: %v", ErrDenied, err)
 	}
 	return c, nil
 }

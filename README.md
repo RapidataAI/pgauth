@@ -2,8 +2,8 @@
 
 pgauth lets people and programs log in to Postgres with a short-lived OIDC access token instead of a
 database password. A client connects to pgauth with the token as its password; pgauth verifies the
-token, creates a temporary Postgres role that holds exactly the rights the token lists, logs in
-upstream as that role and passes bytes through. When the last connection using the role closes,
+token, looks up what the holder may do in Kubernetes-style role bindings, creates a temporary Postgres
+role with exactly that access, logs in upstream as that role and passes bytes through. When the last connection using the role closes,
 pgauth drops it.
 
 ```
@@ -12,11 +12,10 @@ psql "host=pgauth.example.com dbname=main/orders sslmode=verify-full" # password
 
 ## What pgauth is not
 
-- **Not an authorization engine.** pgauth does not decide who may access what; it enforces what the
-  token says. The decision belongs to whoever issues the token (your identity provider, which may in
-  turn ask OpenFGA, SpiceDB or anything else). Projects like
-  [pgauthz](https://github.com/thomasdarimont/pgauthz) evaluate authorization inside Postgres;
-  pgauth does not.
+- **Not a fine-grained authorization engine.** pgauth decides one thing: read, write or nothing on a
+  whole database, from role bindings (see [Access model](#access-model)). Table, row and column rules
+  stay in Postgres grants. Projects like [pgauthz](https://github.com/thomasdarimont/pgauthz) evaluate
+  authorization inside Postgres; pgauth does not.
 - **Not a connection pooler.** Every client connection is one upstream connection. PgBouncer or
   another pooler can sit behind pgauth if you need pooling.
 - **Not a query firewall.** pgauth never reads query text. Rights come only from the Postgres group
@@ -29,19 +28,66 @@ psql "host=pgauth.example.com dbname=main/orders sslmode=verify-full" # password
    is the access token.
 3. pgauth verifies the token against the issuer's JWKS: signature, `iss`, `aud`, `exp`, and the client
    allowlist.
-4. The roles claim (for example `postgres:roles`) lists `<instance>/<db>:<relation>`. Each relation
-   that matches the requested database maps to a group role through `groups` (default `reader` →
-   `<db>_read`, `writer` → `<db>_write`). No match means no connection.
+4. The token names a user (`email` by default) and groups (`groups`). The role bindings decide the
+   level on the requested database, the token's scope caps it (see [Access model](#access-model)),
+   and the level picks the group roles: read joins `<db>_read`, write joins `<db>_read` and
+   `<db>_write` (`groupRoles`). No access means no connection.
 5. pgauth creates or reuses the temporary role `pgauth_<sub8>_<hash6>`, where `hash6` covers the
-   subject, client and matched roles. The role is a member of the mapped groups and of `pgauth_temp`,
-   carries `COMMENT ON ROLE` with the full subject, client and creation time, and has a password only
-   pgauth knows. It never gets `VALID UNTIL` ([ADR 0003](docs/adr/0003-drop-roles-not-valid-until.md)).
+   subject, client, database and level. The role is a member of those group roles and of
+   `pgauth_temp`, carries `COMMENT ON ROLE` with the full subject, user, client and creation time, and
+   has a password only pgauth knows. It never gets `VALID UNTIL` ([ADR 0003](docs/adr/0003-drop-roles-not-valid-until.md)).
 6. pgauth logs in upstream as the role and splices the two connections. Access is checked only here,
    at connect ([ADR 0004](docs/adr/0004-check-at-the-gate-only.md)); `maxConnectionAge` (default 12h)
    bounds how long a connection lives.
 7. When the last connection using a role closes, pgauth drops the role.
 
 Cancel requests work: pgauth hands the client its own cancel key and forwards cancels upstream.
+
+## Access model
+
+pgauth reads `PgRole` and `PgRoleBinding` resources from every `*.yaml` file in `rbac.dir` (several
+documents per file are fine; `kustomization.yaml` is skipped). They work like Kubernetes RBAC:
+
+```yaml
+apiVersion: pgauth.dev/v1alpha1
+kind: PgRole
+metadata: {name: analytics-reader}
+spec:
+  grants:
+    - {instance: cloudsql-main, database: order, level: read}  # level: read|write; database "*" = every database of the instance
+---
+apiVersion: pgauth.dev/v1alpha1
+kind: PgRoleBinding
+metadata: {name: mari-order}
+spec:
+  roleRef: {kind: PgRole, name: cloudsql-main.order.read}
+  subjects:
+    - {kind: Group, name: postgres-admins}
+    - {kind: User, name: mari@example.com}
+```
+
+- **Subjects.** `User` matches the token's `oidc.usernameClaim` (default `email`), exactly.
+  `Group` matches each entry of `oidc.groupsClaim` (default `groups`) after `oidc.groupsPrefix` is
+  prepended.
+- **Built-in roles** need no YAML: `pg-admin` (write on every configured database), `pg-reader`
+  (read on every configured database), and `<instance>.<db>.read` / `<instance>.<db>.write` for
+  every database in `instances`. A `PgRole` may not reuse their names.
+- **Effective access** is the highest level over every binding that matches the user or one of their
+  groups. Write implies read.
+- **Scope cap.** After the bindings, the token's scope caps the level: `postgres:read` caps at read,
+  `postgres:write` allows write, a token with neither is refused (`oidc.scopes` renames them). This is
+  how a token issued to an agent stays read-only although its owner may write.
+- **Reloading.** pgauth rereads the directory every `rbac.reloadInterval` (10s). A set with any error
+  is rejected as a whole and the last valid set stays live; the rejection is logged, counted in the
+  `pgauth.rbac.loads{result="rejected"}` metric, flagged by the `pgauth.rbac.rejected` gauge and shown
+  in the `/readyz` body. pgauth becomes ready only once a first valid set has loaded.
+- **Lint in CI.** `pgauth lint [--config config.yaml] <dir>` checks the schema, unknown fields,
+  duplicate names, role references, subject kinds and, with `--config`, every instance, database and
+  generated role against the config. It reads only those files (not the TLS or credentials files they
+  name), makes no network calls, prints `file:line: message` and exits 1 on any error.
+
+Every connection attempt records the matched bindings, the level after the cap and the cap itself
+(see [Running](#running)).
 
 ## Preparing an instance
 
@@ -96,11 +142,12 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
 `ghcr.io/rapidataai/pgauth:vX.Y.Z` runs as non-root and needs no writable filesystem.
 
 - **Health:** `GET /healthz` answers while the process runs; `GET /readyz` answers 200 once the
-  issuer's keys are loaded and every instance accepts the issuer login (and its startup sweep ran).
+  issuer's keys and a valid set of access rules are loaded and every instance accepts the issuer login
+  (and its startup sweep ran); its body reports a rejected rules change.
 - **Audit:** every connection attempt writes one JSON log line and one OpenTelemetry span
-  `pgauth.connect` with `sub`, `client_id`, `instance`, `db`, `roles`, `decision`, `reason`, `role`
-  and duration. Query text is never recorded. Spans are exported when the standard
-  `OTEL_EXPORTER_OTLP_*` variables are set.
+  `pgauth.connect` with `sub`, `user`, `groups`, `client_id`, `instance`, `db`, `bindings`, `level`,
+  `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded. Spans and
+  metrics are exported when the standard `OTEL_EXPORTER_OTLP_*` variables are set.
 
 ### Multiple replicas
 

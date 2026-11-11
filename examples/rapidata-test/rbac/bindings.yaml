@@ -1,0 +1,19 @@
+# Who may use which database on Rapidata test. Roles come built in: pg-admin, pg-reader and
+# <instance>.<db>.read|write for every database in the serve config's instances.
+apiVersion: pgauth.dev/v1alpha1
+kind: PgRoleBinding
+metadata:
+  name: postgres-admins
+spec:
+  roleRef: {kind: PgRole, name: pg-admin}
+  subjects:
+    - {kind: Group, name: postgres-admins}
+---
+apiVersion: pgauth.dev/v1alpha1
+kind: PgRoleBinding
+metadata:
+  name: mari-order-read
+spec:
+  roleRef: {kind: PgRole, name: cloudsql-main.order.read}
+  subjects:
+    - {kind: User, name: mari@rapidata.ai}
