@@ -66,9 +66,11 @@ spec:
     - {kind: User, name: mari@example.com}
 ```
 
-- **Subjects.** `User` matches the token's `oidc.usernameClaim` (default `email`), exactly.
-  `Group` matches each entry of `oidc.groupsClaim` (default `groups`) after `oidc.groupsPrefix` is
-  prepended.
+- **Subjects.** `User` matches the token's `oidc.usernameClaim` (default `email`), ignoring case
+  (Unicode simple case folding) unless `oidc.usernameCaseInsensitive: false`, because issuers often
+  keep the stored casing of an email. `Group` matches each entry of `oidc.groupsClaim` (default
+  `groups`) exactly, after `oidc.groupsPrefix` is prepended; the claim may be an array or, for a single
+  group, a plain string.
 - **Built-in roles** need no YAML: `pg-admin` (write on every configured database), `pg-reader`
   (read on every configured database), and `<instance>.<db>.read` / `<instance>.<db>.write` for
   every database in `instances`. A `PgRole` may not reuse their names.
@@ -83,7 +85,8 @@ spec:
   in the `/readyz` body. pgauth becomes ready only once a first valid set has loaded.
 - **Lint in CI.** `pgauth lint [--config config.yaml] <dir>` checks the schema, unknown fields,
   duplicate names, role references, subject kinds and, with `--config`, every instance, database and
-  generated role against the config, and warns (exit 0) about `User` names with uppercase letters. It reads only those files (not the TLS or credentials files they
+  generated role against the config, and, when `oidc.usernameCaseInsensitive` is false, warns (exit 0) about `User` names with uppercase
+  letters. It reads only those files (not the TLS or credentials files they
   name), makes no network calls, prints `file:line: message` and exits 1 on any error.
 
 Files first, CRDs later with the same format, and lint plus last-valid-wins instead of an admission
@@ -164,7 +167,8 @@ closed on a pod that then crashed stays until some pod restarts and sweeps it.
 ## Connecting as a person
 
 `pgauth connect` is the connector: it logs you in through the browser (authorization code + PKCE
-against a public OIDC client whose redirect URIs allow `http://127.0.0.1/*`), keeps the refresh token
+against a public OIDC client; the redirect is `http://127.0.0.1:8250/callback`, set by
+`--callback-port`, and port 0 picks a free port for issuers that accept any loopback port per RFC 8252), keeps the refresh token
 in the OS keychain (macOS Keychain, Secret Service on Linux), and listens on `127.0.0.1:5432`. Every
 connection a local client opens is forwarded to pgauth over TLS with a fresh token as the password.
 
@@ -177,7 +181,7 @@ psql "host=127.0.0.1 dbname=main/orders"
 
 The flags can live in `connect.yaml` under your user config directory (`~/Library/Application
 Support/pgauth/` on macOS, `~/.config/pgauth/` on Linux) as `issuer`, `clientId`, `resource`, `scope`,
-`server`, `serverCA` and `listen`; see [`connect.example.yaml`](connect.example.yaml) and, for one
+`server`, `serverCA`, `listen` and `callbackPort`; see [`connect.example.yaml`](connect.example.yaml) and, for one
 real deployment, [`examples/rapidata-test/connect.yaml`](examples/rapidata-test/connect.yaml). Any process of yours that can reach the local port connects with
 your rights, the same trade-off as other local database proxies.
 

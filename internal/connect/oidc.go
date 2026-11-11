@@ -57,9 +57,9 @@ func (c *Connector) login(ctx context.Context, d *discovery) (*tokenResponse, er
 	challenge := sha256.Sum256([]byte(verifier))
 	state := randomString(16)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", c.opts.CallbackPort))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("login callback on port %d: %w", c.opts.CallbackPort, err)
 	}
 	redirect := fmt.Sprintf("http://127.0.0.1:%d/callback", ln.Addr().(*net.TCPAddr).Port)
 	type result struct {

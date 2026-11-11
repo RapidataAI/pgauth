@@ -9,7 +9,8 @@ oidc:
   issuer: https://auth.example.com
   audience: https://postgres.example.com
   usernameClaim: email               # default; matched by `kind: User` subjects
-  groupsClaim: groups                # default; matched by `kind: Group` subjects
+  usernameCaseInsensitive: true      # default; User subjects match the username ignoring case
+  groupsClaim: groups                # default; matched by `kind: Group` subjects; array, or a string for one group
   groupsPrefix: ""                   # default; prepended to every group from the token
   scopes:                            # defaults; a token with neither scope is refused
     read: postgres:read              #   caps access at read

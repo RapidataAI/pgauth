@@ -233,6 +233,7 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 type claims struct {
 	user     string // default defaultUser
 	groups   []string
+	group    string // sent as a plain string claim instead of groups, as IdPs do for one value
 	scope    string // default "postgres:read"
 	client   string
 	audience string
@@ -289,7 +290,9 @@ func TestConnect(t *testing.T) {
 		{"read binding cannot insert", claims{scope: "postgres:write"}, mariOrderRead, "cloudsql-main/order", "INSERT INTO items VALUES (2)", true, false},
 		{"read binding cannot switch to the write group", claims{}, mariOrderRead, "cloudsql-main/order", "SET ROLE order_write", true, false},
 		{"binding on one database does not open another", claims{}, mariOrderRead, "cloudsql-main/assignment", "", false, false},
-		{"user names match exactly", claims{user: "Mari@example.com"}, mariOrderRead, "cloudsql-main/order", "", false, false},
+		{"user names match case-insensitively", claims{user: "MARI@Example.com"}, mariOrderRead, "cloudsql-main/order", "SELECT 1", true, true},
+		{"groups claim as a single string", claims{user: "ada@example.com", group: "postgres-admins", scope: "postgres:write"}, admins, "cloudsql-main/order", "UPDATE items SET id = id", true, true},
+		{"single-string group must match whole", claims{user: "ada@example.com", group: "postgres-admins interns"}, admins, "cloudsql-main/order", "", false, false},
 		{"write binding with write scope updates", claims{scope: "postgres:write"}, mariOrderWrite, "cloudsql-main/order", "UPDATE items SET id = id", true, true},
 		{"write binding still reads", claims{scope: "postgres:write"}, mariOrderWrite, "cloudsql-main/order", "SELECT count(*) FROM items", true, true},
 		{"group pg-admin inserts with write scope", claims{user: "ada@example.com", groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/assignment", "INSERT INTO items VALUES (3)", true, true},
@@ -596,12 +599,19 @@ func (is *issuer) token(c claims) string {
 	raw, err := jwt.Signed(signer).Claims(map[string]any{
 		"iss": is.srv.URL, "sub": "user-1234567890", "aud": c.audience, "client_id": c.client,
 		"exp": exp.Unix(), "iat": time.Now().Add(-time.Hour).Unix(),
-		"email": c.user, "groups": c.groups, "scope": c.scope,
+		"email": c.user, "groups": groupsClaim(c), "scope": c.scope,
 	}).Serialize()
 	if err != nil {
 		panic(err)
 	}
 	return raw
+}
+
+func groupsClaim(c claims) any {
+	if c.group != "" {
+		return c.group
+	}
+	return c.groups
 }
 
 func writeCert(dir string) (certFile, keyFile string, err error) {
