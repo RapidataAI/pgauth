@@ -360,7 +360,8 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 		return nil, d, "access rules are not loaded"
 	}
 	var granted rbac.Level
-	granted, d.bindings = policy.Access(claims.Username, claims.Groups, instName, db)
+	who := rbac.Who{User: claims.Username, Groups: claims.Groups, FoldUser: s.cfg.OIDC.FoldUsername()}
+	granted, d.bindings = policy.Access(who, instName, db)
 	switch {
 	case slices.Contains(claims.Scopes, s.cfg.OIDC.Scopes.Write):
 		d.scopeCap = rbac.Write

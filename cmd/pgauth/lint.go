@@ -24,6 +24,7 @@ func lint(args []string) int {
 		return 2
 	}
 	var instances rbac.Instances
+	foldUsers := true
 	if *path != "" {
 		cfg, err := config.Load(*path)
 		if err != nil {
@@ -31,6 +32,7 @@ func lint(args []string) int {
 			return 1
 		}
 		instances = cfg.Databases()
+		foldUsers = cfg.OIDC.FoldUsername()
 	}
 	files, err := rbac.ReadDir(fs.Arg(0))
 	if err == nil {
@@ -47,7 +49,7 @@ func lint(args []string) int {
 	for _, e := range errs {
 		fmt.Println(e)
 	}
-	for _, w := range res.Warnings() {
+	for _, w := range res.Warnings(foldUsers) {
 		fmt.Println(w)
 	}
 	if len(errs) > 0 {

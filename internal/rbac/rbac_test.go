@@ -103,7 +103,7 @@ spec: {grants: [{instance: bidder, database: bids, level: read}]}
 metadata: {name: y}
 spec: {roleRef: {kind: PgRole, name: bidder.bids.write}, subjects: [{kind: User, name: a}]}
 `, nil, nil, nil},
-		{"uppercase user is valid but warned", header + `kind: PgRoleBinding
+		{"uppercase user is valid, warned only under exact matching", header + `kind: PgRoleBinding
 metadata: {name: x}
 spec:
   roleRef: {kind: PgRole, name: pg-reader}
@@ -115,8 +115,11 @@ spec:
 			files := []File{{Name: "a.yaml", Data: []byte(tt.yaml)}}
 			_, err := Load(files, tt.instances)
 			res, _ := Parse(files)
-			if w := res.Warnings(); len(w) != len(tt.warn) || len(w) > 0 && !strings.Contains(w.Error(), tt.warn[0]) {
-				t.Errorf("warnings = %v, want %q", w, tt.warn)
+			if w := res.Warnings(false); len(w) != len(tt.warn) || len(w) > 0 && !strings.Contains(w.Error(), tt.warn[0]) {
+				t.Errorf("exact matching: warnings = %v, want %q", w, tt.warn)
+			}
+			if w := res.Warnings(true); len(w) > 0 {
+				t.Errorf("case-insensitive matching: warnings = %v, want none", w)
 			}
 			var got []string
 			if err != nil {
@@ -131,6 +134,26 @@ spec:
 				}
 			}
 		})
+	}
+}
+
+func TestUserMatching(t *testing.T) {
+	b := &Binding{Subjects: []Subject{{Kind: "User", Name: "Tom_Mitchell@gmail.com"}}}
+	tests := []struct {
+		user string
+		fold bool
+		want bool
+	}{
+		{"Tom_Mitchell@gmail.com", false, true},
+		{"tom_mitchell@gmail.com", false, false},
+		{"tom_mitchell@gmail.com", true, true},
+		{"TOM_MITCHELL@GMAIL.COM", true, true},
+		{"tom.mitchell@gmail.com", true, false},
+	}
+	for _, tt := range tests {
+		if got := b.matches(Who{User: tt.user, FoldUser: tt.fold}); got != tt.want {
+			t.Errorf("user %q fold %v: match = %v, want %v", tt.user, tt.fold, got, tt.want)
+		}
 	}
 }
 
@@ -149,7 +172,7 @@ func TestLastValidWins(t *testing.T) {
 		if s.Policy() == nil {
 			return None
 		}
-		l, _ := s.Policy().Access("mari@example.com", nil, "cloudsql-main", "order")
+		l, _ := s.Policy().Access(Who{User: "mari@example.com"}, "cloudsql-main", "order")
 		return l
 	}
 	waitFor := func(what string, ok func() bool) {

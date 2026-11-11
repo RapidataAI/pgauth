@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 )
 
 // Built-in role names; generated roles are "<instance>.<db>.read" and "<instance>.<db>.write".
@@ -101,13 +102,21 @@ func builtinRoles(instances Instances) []*Role {
 	return out
 }
 
-// Access returns the highest level any binding of user or one of groups grants on instance/db,
-// and the names of the bindings that grant it.
-func (p *Policy) Access(user string, groups []string, instance, db string) (Level, []string) {
+// Who is the holder a binding is matched against.
+type Who struct {
+	User   string
+	Groups []string
+	// FoldUser compares User subjects case-insensitively (Unicode simple case folding).
+	FoldUser bool
+}
+
+// Access returns the highest level any binding of who grants on instance/db, and the names of the
+// bindings that grant it.
+func (p *Policy) Access(who Who, instance, db string) (Level, []string) {
 	level := None
 	var matched []string
 	for _, b := range p.bindings {
-		if !b.matches(user, groups) {
+		if !b.matches(who) {
 			continue
 		}
 		role := p.roles[b.RoleRef]
@@ -128,9 +137,13 @@ func (p *Policy) Access(user string, groups []string, instance, db string) (Leve
 	return level, matched
 }
 
-func (b *Binding) matches(user string, groups []string) bool {
+func (b *Binding) matches(who Who) bool {
 	for _, s := range b.Subjects {
-		if s.Kind == "User" && user != "" && s.Name == user || s.Kind == "Group" && slices.Contains(groups, s.Name) {
+		switch {
+		case s.Kind == "Group" && slices.Contains(who.Groups, s.Name):
+			return true
+		case s.Kind != "User" || who.User == "":
+		case s.Name == who.User, who.FoldUser && strings.EqualFold(s.Name, who.User):
 			return true
 		}
 	}

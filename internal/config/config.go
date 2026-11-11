@@ -51,7 +51,9 @@ type OIDC struct {
 	Issuer        string `json:"issuer"`
 	Audience      string `json:"audience"`
 	UsernameClaim string `json:"usernameClaim"`
-	GroupsClaim   string `json:"groupsClaim"`
+	// UsernameCaseInsensitive compares User subjects to the username ignoring case; nil means true.
+	UsernameCaseInsensitive *bool  `json:"usernameCaseInsensitive"`
+	GroupsClaim             string `json:"groupsClaim"`
 	// GroupsPrefix is prepended to every group from the token before bindings are matched.
 	GroupsPrefix  string `json:"groupsPrefix"`
 	Scopes        Scopes `json:"scopes"`
@@ -216,6 +218,10 @@ func (c *Config) GroupRole(level, db string) string {
 		tmpl = c.GroupRoles.Write
 	}
 	return strings.ReplaceAll(tmpl, "{db}", db)
+}
+
+func (o OIDC) FoldUsername() bool {
+	return o.UsernameCaseInsensitive == nil || *o.UsernameCaseInsensitive
 }
 
 // Databases maps every instance to the databases pgauth serves on it.

@@ -66,9 +66,11 @@ spec:
     - {kind: User, name: mari@example.com}
 ```
 
-- **Subjects.** `User` matches the token's `oidc.usernameClaim` (default `email`), exactly.
-  `Group` matches each entry of `oidc.groupsClaim` (default `groups`) after `oidc.groupsPrefix` is
-  prepended.
+- **Subjects.** `User` matches the token's `oidc.usernameClaim` (default `email`), ignoring case
+  (Unicode simple case folding) unless `oidc.usernameCaseInsensitive: false`, because issuers often
+  keep the stored casing of an email. `Group` matches each entry of `oidc.groupsClaim` (default
+  `groups`) exactly, after `oidc.groupsPrefix` is prepended; the claim may be an array or, for a single
+  group, a plain string.
 - **Built-in roles** need no YAML: `pg-admin` (write on every configured database), `pg-reader`
   (read on every configured database), and `<instance>.<db>.read` / `<instance>.<db>.write` for
   every database in `instances`. A `PgRole` may not reuse their names.
@@ -83,7 +85,8 @@ spec:
   in the `/readyz` body. pgauth becomes ready only once a first valid set has loaded.
 - **Lint in CI.** `pgauth lint [--config config.yaml] <dir>` checks the schema, unknown fields,
   duplicate names, role references, subject kinds and, with `--config`, every instance, database and
-  generated role against the config, and warns (exit 0) about `User` names with uppercase letters. It reads only those files (not the TLS or credentials files they
+  generated role against the config, and, when `oidc.usernameCaseInsensitive` is false, warns (exit 0) about `User` names with uppercase
+  letters. It reads only those files (not the TLS or credentials files they
   name), makes no network calls, prints `file:line: message` and exits 1 on any error.
 
 Files first, CRDs later with the same format, and lint plus last-valid-wins instead of an admission

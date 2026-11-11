@@ -110,7 +110,7 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	if c.Username == "" {
 		return Claims{}, fmt.Errorf("%w: no %s claim", ErrDenied, v.cfg.UsernameClaim)
 	}
-	groups, err := stringList(all[v.cfg.GroupsClaim])
+	groups, err := stringList(all[v.cfg.GroupsClaim], false)
 	if err != nil {
 		return Claims{}, fmt.Errorf("%w: claim %s: %v", ErrDenied, v.cfg.GroupsClaim, err)
 	}
@@ -121,7 +121,7 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	if scope == nil {
 		scope = all["scp"]
 	}
-	if c.Scopes, err = stringList(scope); err != nil {
+	if c.Scopes, err = stringList(scope, true); err != nil {
 		return Claims{}, fmt.Errorf("%w: claim scope: %v", ErrDenied, err)
 	}
 	return c, nil
@@ -143,12 +143,20 @@ func reason(err error) string {
 	}
 }
 
-func stringList(v any) ([]string, error) {
+// stringList reads a claim that is an array of strings or a single string; split breaks the string
+// on spaces (the OAuth scope format), otherwise it is one entry.
+func stringList(v any, split bool) ([]string, error) {
 	switch v := v.(type) {
 	case nil:
 		return nil, nil
 	case string:
-		return strings.Fields(v), nil
+		if split {
+			return strings.Fields(v), nil
+		}
+		if v == "" {
+			return nil, nil
+		}
+		return []string{v}, nil
 	case []any:
 		out := make([]string, 0, len(v))
 		for _, e := range v {
@@ -160,6 +168,6 @@ func stringList(v any) ([]string, error) {
 		}
 		return out, nil
 	default:
-		return nil, errors.New("must be an array or a space-separated string")
+		return nil, errors.New("must be a string or an array of strings")
 	}
 }

@@ -291,13 +291,17 @@ func (p *parser) binding(spec *yaml.Node, name string) *Binding {
 	return b
 }
 
-// Warnings are findings that do not make the resources invalid.
-func (res *Resources) Warnings() Errors {
+// Warnings are findings that do not make the resources invalid. Uppercase User names are flagged
+// only when users are compared exactly (foldUsers false).
+func (res *Resources) Warnings(foldUsers bool) Errors {
 	var out Errors
+	if foldUsers {
+		return nil
+	}
 	for _, b := range res.Bindings {
 		for _, s := range b.Subjects {
 			if s.Kind == "User" && s.Name != strings.ToLower(s.Name) {
-				out = append(out, Error{s.Pos, fmt.Sprintf("warning: User %s has uppercase letters; user names match exactly and emails are usually lowercase", s.Name)})
+				out = append(out, Error{s.Pos, fmt.Sprintf("warning: User %s has uppercase letters; oidc.usernameCaseInsensitive is false, so it matches only that exact casing", s.Name)})
 			}
 		}
 	}
