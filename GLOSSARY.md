@@ -8,6 +8,10 @@ Scoped access to Rapidata's Postgres databases: who may read or write which data
 The right to read or write one Postgres database or a whole instance, written as a grant of a `PgRole`. Any account can be bound to one, not only staff.
 _Avoid_: permission, access right, ACL
 
+**Built-in role**:
+A `PgRole` pgauth provides without YAML: `pg-admin` (write everywhere), `pg-reader` (read everywhere) and the generated `<instance>.<db>.read|write` for every configured database.
+_Avoid_: default role, system role
+
 **Role binding**:
 A `PgRoleBinding` that gives one `PgRole`'s database grants to users and groups named in the token.
 _Avoid_: assignment, membership

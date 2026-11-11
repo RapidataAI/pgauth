@@ -21,6 +21,7 @@ func TestLint(t *testing.T) {
 		yaml      string
 		instances Instances
 		want      []string // each a substring of one error, in order; empty = valid
+		warn      []string
 	}{
 		{"valid role, bindings to built-in and generated roles", header + `kind: PgRole
 metadata: {name: analyst}
@@ -45,18 +46,18 @@ metadata: {name: mari-order}
 spec:
   roleRef: {kind: PgRole, name: cloudsql-main.order.read}
   subjects: [{kind: User, name: mari@example.com}]
-`, instances, nil},
+`, instances, nil, nil},
 		{"unknown field", header + `kind: PgRoleBinding
 metadata: {name: x}
 spec:
   roleRef: {kind: PgRole, name: pg-admin}
   subject: [{kind: User, name: a}]
-`, instances, []string{"a.yaml:6: unknown field spec.subject", "a.yaml:5: spec.subjects is required"}},
+`, instances, []string{"a.yaml:6: unknown field spec.subject", "a.yaml:5: spec.subjects is required"}, nil},
 		{"wrong apiVersion and kind", `apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata: {name: x}
 spec: {}
-`, instances, []string{"a.yaml:1: apiVersion must be pgauth.dev/v1alpha1", "a.yaml:2: kind must be PgRole or PgRoleBinding"}},
+`, instances, []string{"a.yaml:1: apiVersion must be pgauth.dev/v1alpha1", "a.yaml:2: kind must be PgRole or PgRoleBinding"}, nil},
 		{"duplicate binding", header + `kind: PgRoleBinding
 metadata: {name: x}
 spec: {roleRef: {kind: PgRole, name: pg-admin}, subjects: [{kind: User, name: a}]}
@@ -64,24 +65,24 @@ spec: {roleRef: {kind: PgRole, name: pg-admin}, subjects: [{kind: User, name: a}
 ` + header + `kind: PgRoleBinding
 metadata: {name: x}
 spec: {roleRef: {kind: PgRole, name: pg-reader}, subjects: [{kind: User, name: b}]}
-`, instances, []string{"a.yaml:6: duplicate PgRoleBinding x, first defined at a.yaml:1"}},
+`, instances, []string{"a.yaml:6: duplicate PgRoleBinding x, first defined at a.yaml:1"}, nil},
 		{"role with a built-in name", header + `kind: PgRole
 metadata: {name: cloudsql-main.order.read}
 spec: {grants: [{instance: cloudsql-main, database: order, level: write}]}
-`, instances, []string{"a.yaml:1: PgRole cloudsql-main.order.read has the name of a built-in role"}},
+`, instances, []string{"a.yaml:1: PgRole cloudsql-main.order.read has the name of a built-in role"}, nil},
 		{"roleRef to a missing role", header + `kind: PgRoleBinding
 metadata: {name: x}
 spec:
   roleRef: {kind: PgRole, name: cloudsql-main.billing.read}
   subjects: [{kind: User, name: a}]
-`, instances, []string{"a.yaml:5: roleRef cloudsql-main.billing.read names no PgRole"}},
+`, instances, []string{"a.yaml:5: roleRef cloudsql-main.billing.read names no PgRole"}, nil},
 		{"grants outside the config", header + `kind: PgRole
 metadata: {name: x}
 spec:
   grants:
     - {instance: bidder, database: bids, level: read}
     - {instance: cloudsql-main, database: billing, level: read}
-`, instances, []string{"a.yaml:6: instance bidder is not configured", "a.yaml:7: database cloudsql-main/billing is not configured"}},
+`, instances, []string{"a.yaml:6: instance bidder is not configured", "a.yaml:7: database cloudsql-main/billing is not configured"}, nil},
 		{"bad subject kind and level", header + `kind: PgRole
 metadata: {name: x}
 spec: {grants: [{instance: cloudsql-main, database: order, level: admin}]}
@@ -92,8 +93,8 @@ spec:
   roleRef: {kind: PgRole, name: x}
   subjects:
     - {kind: ServiceAccount, name: a}
-`, instances, []string{"a.yaml:4: spec.grants[].level must be read or write", "a.yaml:12: spec.subjects[].kind must be User or Group"}},
-		{"broken YAML", header + "kind: PgRole\nmetadata: {name: x\n", instances, []string{"a.yaml:2: yaml: line 2:"}},
+`, instances, []string{"a.yaml:4: spec.grants[].level must be read or write", "a.yaml:12: spec.subjects[].kind must be User or Group"}, nil},
+		{"broken YAML", header + "kind: PgRole\nmetadata: {name: x\n", instances, []string{"a.yaml:2: yaml: line 2:"}, nil},
 		{"without a config, instances and generated roles are not checked", header + `kind: PgRole
 metadata: {name: x}
 spec: {grants: [{instance: bidder, database: bids, level: read}]}
@@ -101,11 +102,22 @@ spec: {grants: [{instance: bidder, database: bids, level: read}]}
 ` + header + `kind: PgRoleBinding
 metadata: {name: y}
 spec: {roleRef: {kind: PgRole, name: bidder.bids.write}, subjects: [{kind: User, name: a}]}
-`, nil, nil},
+`, nil, nil, nil},
+		{"uppercase user is valid but warned", header + `kind: PgRoleBinding
+metadata: {name: x}
+spec:
+  roleRef: {kind: PgRole, name: pg-reader}
+  subjects: [{kind: User, name: Mari@example.com}, {kind: Group, name: Admins}]
+`, instances, nil, []string{"a.yaml:6: warning: User Mari@example.com has uppercase letters"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := Load([]File{{Name: "a.yaml", Data: []byte(tt.yaml)}}, tt.instances)
+			files := []File{{Name: "a.yaml", Data: []byte(tt.yaml)}}
+			_, err := Load(files, tt.instances)
+			res, _ := Parse(files)
+			if w := res.Warnings(); len(w) != len(tt.warn) || len(w) > 0 && !strings.Contains(w.Error(), tt.warn[0]) {
+				t.Errorf("warnings = %v, want %q", w, tt.warn)
+			}
 			var got []string
 			if err != nil {
 				got = strings.Split(err.Error(), "\n")

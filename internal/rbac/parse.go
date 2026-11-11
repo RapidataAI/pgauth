@@ -61,6 +61,7 @@ type Role struct {
 type Subject struct {
 	Kind string // "User" or "Group"
 	Name string
+	Pos  Pos
 }
 
 type Binding struct {
@@ -281,13 +282,26 @@ func (p *parser) binding(spec *yaml.Node, name string) *Binding {
 		if sm == nil {
 			continue
 		}
-		subj := Subject{Kind: p.str(sm, "kind", "spec.subjects[]", s), Name: p.str(sm, "name", "spec.subjects[]", s)}
+		subj := Subject{Kind: p.str(sm, "kind", "spec.subjects[]", s), Name: p.str(sm, "name", "spec.subjects[]", s), Pos: p.pos(s)}
 		if subj.Kind != "" && subj.Kind != "User" && subj.Kind != "Group" {
 			p.errorf(sm["kind"], "spec.subjects[].kind must be User or Group, got %s", subj.Kind)
 		}
 		b.Subjects = append(b.Subjects, subj)
 	}
 	return b
+}
+
+// Warnings are findings that do not make the resources invalid.
+func (res *Resources) Warnings() Errors {
+	var out Errors
+	for _, b := range res.Bindings {
+		for _, s := range b.Subjects {
+			if s.Kind == "User" && s.Name != strings.ToLower(s.Name) {
+				out = append(out, Error{s.Pos, fmt.Sprintf("warning: User %s has uppercase letters; user names match exactly and emails are usually lowercase", s.Name)})
+			}
+		}
+	}
+	return out
 }
 
 var lineInErr = regexp.MustCompile(`line (\d+)`)

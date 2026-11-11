@@ -47,6 +47,9 @@ func lint(args []string) int {
 	for _, e := range errs {
 		fmt.Println(e)
 	}
+	for _, w := range res.Warnings() {
+		fmt.Println(w)
+	}
 	if len(errs) > 0 {
 		return 1
 	}

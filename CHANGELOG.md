@@ -14,7 +14,7 @@ pgauth now decides access itself from Kubernetes-style role bindings ([ADR 0007]
 - `oidc.usernameClaim` (default `email`), `oidc.groupsClaim` (default `groups`), `oidc.groupsPrefix`.
 - Built-in roles `pg-admin`, `pg-reader` and `<instance>.<db>.read|write`.
 - Reload on change with last-valid-wins, metrics `pgauth.rbac.loads` and `pgauth.rbac.rejected`, and rejection details on `/readyz`.
-- `pgauth lint [--config <file>] <dir>` for CI.
+- `pgauth lint [--config <file>] <dir>` for CI; it warns about `User` names with uppercase letters.
 - `groupRoles` (defaults `{db}_read` / `{db}_write`) names the Postgres group role per level; write joins both.
 - The connect span and log carry `user`, `groups`, `bindings`, `level` and `scope_cap` instead of `roles`.
 
