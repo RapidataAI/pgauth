@@ -35,6 +35,15 @@ func configPath(flagValue string) string {
 	return "connect.yaml"
 }
 
+// cacheDir holds the last discovery per environment: the user cache directory, else next to the
+// config (vessels without a home cache).
+func cacheDir(cfgPath string) string {
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "pgauth")
+	}
+	return filepath.Dir(cfgPath)
+}
+
 // parseInterspersed lets flags follow positional arguments, as in `env add prod host --write`.
 func parseInterspersed(fs *flag.FlagSet, args []string) []string {
 	var pos []string
@@ -67,7 +76,8 @@ func connectCmd(args []string) error {
 	_ = fs.Parse(args)
 
 	log := newLog()
-	f, err := connect.LoadFile(configPath(*path))
+	cfgPath := configPath(*path)
+	f, err := connect.LoadFile(cfgPath)
 	if err != nil {
 		return err
 	}
@@ -91,7 +101,7 @@ func connectCmd(args []string) error {
 	if err := f.Validate(); err != nil {
 		return err
 	}
-	envs, err := f.BuildEnvs(connect.BuildOptions{Store: connect.Keychain{}, OpenBrowser: openBrowser, CallbackPort: port, Log: log})
+	envs, err := f.BuildEnvs(connect.BuildOptions{Store: connect.Keychain{}, OpenBrowser: openBrowser, CallbackPort: port, Log: log, CacheDir: cacheDir(cfgPath)})
 	if err != nil {
 		return err
 	}
@@ -188,7 +198,7 @@ func loadEnvs(path string, log *slog.Logger) (*connect.File, *connect.Router, er
 	if f.CallbackPort != nil {
 		port = *f.CallbackPort
 	}
-	envs, err := f.BuildEnvs(connect.BuildOptions{Store: connect.Keychain{}, OpenBrowser: openBrowser, CallbackPort: port, Log: log})
+	envs, err := f.BuildEnvs(connect.BuildOptions{Store: connect.Keychain{}, OpenBrowser: openBrowser, CallbackPort: port, Log: log, CacheDir: cacheDir(path)})
 	if err != nil {
 		return nil, nil, err
 	}

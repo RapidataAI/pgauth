@@ -3,12 +3,16 @@ package connect
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -236,5 +240,63 @@ func TestExampleConfigsValidate(t *testing.T) {
 		if err != nil || f.Legacy() {
 			t.Errorf("%s: %v (legacy %v)", path, err, f.Legacy())
 		}
+	}
+}
+
+// TestDiscoveryFallback walks one environment through an API that answers, goes away and hangs;
+// each row starts a fresh Env, as a restarted connector would, unless it keeps the last one.
+func TestDiscoveryFallback(t *testing.T) {
+	disc := api.Discovery{Instances: []api.Instance{{Name: "main", Databases: []string{"order"}}}}
+	var mode atomic.Value // "up", "down" or "hang"
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch mode.Load() {
+		case "down":
+			http.Error(w, "down", http.StatusServiceUnavailable)
+		case "hang":
+			<-r.Context().Done()
+		default:
+			_ = json.NewEncoder(w).Encode(disc)
+		}
+	}))
+	defer srv.Close()
+	cache := filepath.Join(t.TempDir(), "discovery-test.json")
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	newRouter := func(cacheFile string) *Router {
+		return NewRouter([]*Env{{Name: "test", API: srv.URL, HTTP: srv.Client(), CacheFile: cacheFile, LookupTimeout: 300 * time.Millisecond}}, log)
+	}
+	tests := []struct {
+		name, mode, cacheFile, database string
+		want, err                       string
+		maxTime                         time.Duration
+	}{
+		{"api up resolves and caches", "up", cache, "test/order", "main/order", "", 0},
+		{"api down, cached answer from disk", "down", cache, "test/order", "main/order", "", 0},
+		{"api down, no cache", "down", "", "test/order", "",
+			"pgauth api " + srv.URL + " unreachable (503 Service Unavailable); use test/<instance>/order to connect without it", 0},
+		{"api hangs, short timeout", "hang", "", "test/order", "",
+			"pgauth api " + srv.URL + " unreachable (timeout); use test/<instance>/order to connect without it", 2 * time.Second},
+		{"instance-qualified needs no api", "hang", "", "test/main/order", "main/order", "", 100 * time.Millisecond},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mode.Store(tt.mode)
+			start := time.Now()
+			_, got, err := newRouter(tt.cacheFile).Resolve(context.Background(), tt.database)
+			if tt.maxTime > 0 && time.Since(start) > tt.maxTime {
+				t.Errorf("took %s, want under %s", time.Since(start), tt.maxTime)
+			}
+			if tt.err != "" {
+				if err == nil || err.Error() != tt.err {
+					t.Fatalf("err = %v\nwant  %s", err, tt.err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("got %q, %v; want %s", got, err, tt.want)
+			}
+		})
+	}
+	if lookupTimeout != 3*time.Second {
+		t.Errorf("default lookup timeout = %s, want 3s", lookupTimeout)
 	}
 }

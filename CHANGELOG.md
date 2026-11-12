@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.1
+
+- `pgauth connect` looks up `<env>/<db>` with a 3 s timeout, keeps the last discovery per environment on disk (user cache directory, else next to the config) and uses it while the API is down. With no answer at all, the error says what to do: `pgauth api <url> unreachable (<cause>); use <env>/<instance>/<db> to connect without it`.
+
 ## v0.5.0
 
 - `pgauth connect` reaches several pgauth deployments as `environments` in `connect.yaml`; the database name is the address (`<env>/<db>` or `<env>/<instance>/<db>`, no default environment). Tokens come from a browser login (keychain per environment) or a `file` re-read on every connection; token problems fail only that connection with `FATAL 28000` and the status file's text, never the connector. Missing grants read `no access to <env>/<db>: no binding grants it`. `--config` / `$PGAUTH_CONFIG` pick the config.

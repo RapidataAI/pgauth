@@ -188,7 +188,11 @@ psql "host=127.0.0.1 dbname=prod/cloudsql-main/order"  # <env>/<instance>/<db>
 ```
 
 There is no default environment: a bare `order` fails with `use <env>/<db>; environments: prod,
-test`, and a name on several instances fails and lists the full addresses.
+test`, and a name on several instances fails and lists the full addresses. `<env>/<db>` is looked up
+in the server's discovery (3 s timeout); the last answer is kept in the user cache directory (or next
+to the config), so a short API outage does not break it. With no answer at all the connection fails
+with `pgauth api https://<host>:8443 unreachable (<cause>); use <env>/<instance>/<db> to connect
+without it`, and `<env>/<instance>/<db>` never needs the API.
 
 1. `pgauth env add prod pgauth.example.com` reads the server's discovery
    (`https://<host>:8443/.well-known/pgauth`), pins its issuer and CLI client in `connect.yaml`, logs
