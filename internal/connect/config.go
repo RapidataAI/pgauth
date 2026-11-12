@@ -231,6 +231,8 @@ type BuildOptions struct {
 	OpenBrowser  func(url string) error
 	CallbackPort int
 	Log          *slog.Logger
+	// CacheDir keeps each environment's last discovery; empty disables the disk cache.
+	CacheDir string
 }
 
 // BuildEnvs turns a validated config into environments ready to serve.
@@ -260,10 +262,14 @@ func (f *File) BuildEnvs(o BuildOptions) ([]*Env, error) {
 			}
 			up.tokens = c
 		}
-		envs = append(envs, &Env{
+		env := &Env{
 			Name: name, up: up, API: ec.APIURL(),
 			HTTP: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}},
-		})
+		}
+		if o.CacheDir != "" {
+			env.CacheFile = filepath.Join(o.CacheDir, "discovery-"+name+".json")
+		}
+		envs = append(envs, env)
 	}
 	return envs, nil
 }

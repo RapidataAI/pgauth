@@ -3,10 +3,13 @@ package connect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -24,30 +27,117 @@ type Env struct {
 	// API is the base URL of serve's HTTPS endpoints.
 	API  string
 	HTTP *http.Client
+	// CacheFile keeps the last discovery that succeeded, so bare names survive an API outage.
+	CacheFile string
+	// LookupTimeout bounds a discovery request; default lookupTimeout.
+	LookupTimeout time.Duration
 
 	mu     sync.Mutex
 	disc   *api.Discovery
 	discAt time.Time
 }
 
-// discoveryTTL bounds how stale the instance list used to resolve "<env>/<db>" may be.
+// discoveryTTL bounds how stale the instance list used to resolve "<env>/<db>" may be while the
+// API answers; when it does not, the last answer is used however old.
 const discoveryTTL = time.Minute
+
+// lookupTimeout keeps a client from hanging on an unreachable API before it sees the error.
+const lookupTimeout = 3 * time.Second
+
+// unreachableError says the API could not be asked and how to connect without it.
+type unreachableError struct {
+	api, cause string
+}
+
+func (e unreachableError) Error() string {
+	return "pgauth api " + e.api + " unreachable (" + e.cause + ")"
+}
+
+func shortCause(err error) string {
+	msg := err.Error()
+	for _, c := range []struct{ match, cause string }{
+		{"deadline exceeded", "timeout"},
+		{"Client.Timeout", "timeout"},
+		{"connection refused", "connection refused"},
+		{"no such host", "no such host"},
+		{"certificate", "TLS certificate not trusted"},
+		{"network is unreachable", "network unreachable"},
+	} {
+		if strings.Contains(msg, c.match) {
+			return c.cause
+		}
+	}
+	if i := strings.LastIndex(msg, ": "); i >= 0 && i+2 < len(msg) {
+		msg = msg[i+2:]
+	}
+	return msg
+}
 
 func (e *Env) Tokens() TokenSource { return e.up.tokens }
 
-// Discovery fetches serve's /.well-known/pgauth, cached for discoveryTTL.
+// Discovery fetches serve's /.well-known/pgauth, cached for discoveryTTL in memory and, as the
+// last known answer, in CacheFile. When the API cannot be reached, the last answer is used.
 func (e *Env) Discovery(ctx context.Context) (*api.Discovery, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.disc != nil && time.Since(e.discAt) < discoveryTTL {
 		return e.disc, nil
 	}
-	var d api.Discovery
-	if err := getJSON(ctx, e.HTTP, e.API+"/.well-known/pgauth", "", &d); err != nil {
-		return nil, err
+	timeout := e.LookupTimeout
+	if timeout == 0 {
+		timeout = lookupTimeout
 	}
-	e.disc, e.discAt = &d, time.Now()
-	return e.disc, nil
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var d api.Discovery
+	err := getJSON(lookupCtx, e.HTTP, e.API+"/.well-known/pgauth", "", &d)
+	if err == nil {
+		e.disc, e.discAt = &d, time.Now()
+		e.saveCache(&d)
+		return e.disc, nil
+	}
+	if e.disc == nil {
+		e.disc = e.loadCache()
+	}
+	if e.disc != nil {
+		return e.disc, nil
+	}
+	return nil, unreachableError{api: e.API, cause: shortCause(err)}
+}
+
+type cachedDiscovery struct {
+	API       string        `json:"api"`
+	Discovery api.Discovery `json:"discovery"`
+}
+
+func (e *Env) saveCache(d *api.Discovery) {
+	if e.CacheFile == "" {
+		return
+	}
+	b, err := json.Marshal(cachedDiscovery{API: e.API, Discovery: *d})
+	if err != nil || os.MkdirAll(filepath.Dir(e.CacheFile), 0o700) != nil {
+		return
+	}
+	tmp := e.CacheFile + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		_ = os.Rename(tmp, e.CacheFile)
+	}
+}
+
+// loadCache returns the cached discovery if it was written for this environment's API.
+func (e *Env) loadCache() *api.Discovery {
+	if e.CacheFile == "" {
+		return nil
+	}
+	b, err := os.ReadFile(e.CacheFile)
+	if err != nil {
+		return nil
+	}
+	var c cachedDiscovery
+	if json.Unmarshal(b, &c) != nil || c.API != e.API {
+		return nil
+	}
+	return &c.Discovery
 }
 
 // Access lists what this environment's token reaches.
@@ -143,6 +233,10 @@ func (r *Router) resolveIn(ctx context.Context, e *Env, parts []string, database
 	db := parts[0]
 	d, err := e.Discovery(ctx)
 	if err != nil {
+		var unreachable unreachableError
+		if errors.As(err, &unreachable) {
+			return nil, "", routeError{fmt.Sprintf("%v; use %s/<instance>/%s to connect without it", err, e.Name, db)}
+		}
 		return nil, "", routeError{fmt.Sprintf("cannot look up %s: %v", database, err)}
 	}
 	switch c := candidates(d, db); len(c) {
