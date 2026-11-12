@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
+	"github.com/RapidataAI/pgauth/internal/api"
 	"github.com/RapidataAI/pgauth/internal/config"
 	"github.com/RapidataAI/pgauth/internal/proxy"
 	"github.com/RapidataAI/pgauth/internal/rbac"
@@ -94,11 +95,25 @@ func serve(args []string) error {
 		return err
 	}
 	go store.WatchDir(ctx, cfg.RBAC.Dir, time.Duration(cfg.RBAC.ReloadInterval))
-	srv := proxy.New(cfg, verifier, store, &tls.Config{GetCertificate: certs.get, MinVersion: tls.VersionTLS12}, log)
+	tlsConfig := &tls.Config{GetCertificate: certs.get, MinVersion: tls.VersionTLS12}
+	srv := proxy.New(cfg, verifier, store, tlsConfig, log)
 	srv.Start(ctx)
 
 	if cfg.Health != "" {
 		go serveHealth(ctx, cfg.Health, srv, store, log)
+	}
+	if cfg.HTTP.Listen != "" {
+		hs := &http.Server{Addr: cfg.HTTP.Listen, Handler: api.New(cfg, verifier, store).Handler(), TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			<-ctx.Done()
+			_ = hs.Close()
+		}()
+		go func() {
+			if err := hs.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("https server", "error", err)
+				stop()
+			}
+		}()
 	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

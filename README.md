@@ -154,6 +154,11 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
 - **Health:** `GET /healthz` answers while the process runs; `GET /readyz` answers 200 once the
   issuer's keys and a valid set of access rules are loaded and every instance accepts the issuer login
   (and its startup sweep ran); its body reports a rejected rules change.
+- **HTTPS API** (`http.listen`, same certificate as Postgres; [ADR 0011](docs/adr/0011-serve-publishes-discovery-and-access.md)):
+  - `GET /.well-known/pgauth` → `{postgres, issuer, audience, cli_client_id, scopes: {read, write},
+    instances: [{name, databases}]}`, public, so a connector can set itself up from a host name.
+  - `GET /v1/access` with `Authorization: Bearer <token>` → `[{instance, database, level}]`: every
+    database the token reaches, after the bindings and the scope cap.
 - **Audit:** every connection attempt writes one JSON log line and one OpenTelemetry span
   `pgauth.connect` with `sub`, `user`, `groups`, `client_id`, `instance`, `db`, `bindings`, `granted`
   (level from the bindings), `level` (after the cap), `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded.

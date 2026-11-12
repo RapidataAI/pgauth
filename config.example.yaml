@@ -1,5 +1,10 @@
 listen: ":5432"
-health: ":8080"            # GET /healthz (live), /readyz (keys loaded, every instance reachable as the issuer)
+health: ":8080"
+http:
+  listen: ":8443"          # HTTPS with the tls certificate: GET /.well-known/pgauth, GET /v1/access
+discovery:
+  cliClientId: pgauth-cli  # public OIDC client connectors log in with
+  # postgres: pgauth.example.com:5432   # default: the request's host and the listen port            # GET /healthz (live), /readyz (keys loaded, every instance reachable as the issuer)
 
 tls:
   certFile: /etc/pgauth/tls/tls.crt   # reread when the file changes

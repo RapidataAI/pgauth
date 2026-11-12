@@ -36,6 +36,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/RapidataAI/pgauth/internal/api"
 	"github.com/RapidataAI/pgauth/internal/config"
 	pgconnect "github.com/RapidataAI/pgauth/internal/connect"
 	"github.com/RapidataAI/pgauth/internal/rbac"
@@ -179,7 +180,8 @@ spec:
 
 // startServer runs a pgauth with adminBinding against the shared Postgres; the returned store
 // swaps the access rules.
-func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store, *auditLog) {
+// startServer also serves the HTTPS API (discovery, access) and returns its base URL.
+func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store, *auditLog, *httptest.Server) {
 	t.Helper()
 	cfg := &config.Config{
 		TLS: config.TLS{CertFile: shared.certFile, KeyFile: shared.keyFile},
@@ -235,7 +237,9 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		cancel()
 		<-done
 	})
-	return ln.Addr().String(), store, audit
+	apiSrv := httptest.NewTLSServer(api.New(cfg, verifier, store).Handler())
+	t.Cleanup(apiSrv.Close)
+	return ln.Addr().String(), store, audit, apiSrv
 }
 
 // auditLog keeps the server's JSON log lines so tests can read the connect record.
@@ -349,7 +353,7 @@ spec:
 `
 
 func TestConnect(t *testing.T) {
-	addr, store, audit := startServer(t, nil)
+	addr, store, audit, _ := startServer(t, nil)
 	var (
 		mariOrderRead  = binding("mari-order", "cloudsql-main.order.read", user(defaultUser))
 		mariOrderWrite = binding("mari-order", "cloudsql-main.order.write", user(defaultUser))
@@ -441,6 +445,79 @@ func TestConnect(t *testing.T) {
 	}
 }
 
+func TestAPI(t *testing.T) {
+	_, store, _, apiSrv := startServer(t, func(cfg *config.Config) {
+		cfg.Discovery = config.Discovery{CLIClientID: "pgauth-cli", Postgres: "pgauth.example.test:5432"}
+	})
+	var disc api.Discovery
+	if code := getJSON(t, apiSrv, "/.well-known/pgauth", "", &disc); code != http.StatusOK {
+		t.Fatalf("discovery: %d", code)
+	}
+	if disc.Postgres != "pgauth.example.test:5432" || disc.Issuer != shared.issuer.srv.URL || disc.Audience != audience ||
+		disc.CLIClientID != "pgauth-cli" || disc.Scopes != (api.Scopes{Read: "postgres:read", Write: "postgres:write"}) ||
+		len(disc.Instances) != 1 || disc.Instances[0].Name != instanceName || strings.Join(disc.Instances[0].Databases, ",") != "order,assignment" {
+		t.Fatalf("discovery = %+v", disc)
+	}
+
+	admins := binding("admins", "pg-admin", group("postgres-admins"))
+	tests := []struct {
+		name     string
+		claims   claims
+		bindings string
+		code     int
+		want     string // instance/db:level entries, comma-separated
+	}{
+		{"read scope caps pg-admin", claims{groups: []string{"postgres-admins"}}, admins, 200, "cloudsql-main/order:read,cloudsql-main/assignment:read"},
+		{"write scope keeps write", claims{groups: []string{"postgres-admins"}, scope: "postgres:write"}, admins, 200, "cloudsql-main/order:write,cloudsql-main/assignment:write"},
+		{"one database binding", claims{}, binding("mari", "cloudsql-main.order.read", user(defaultUser)), 200, "cloudsql-main/order:read"},
+		{"no binding, empty list", claims{groups: []string{"interns"}}, admins, 200, ""},
+		{"no postgres scope, empty list", claims{groups: []string{"postgres-admins"}, scope: "openid"}, admins, 200, ""},
+		{"expired token", claims{expired: true}, admins, 401, ""},
+		{"no token", claims{user: "-"}, admins, 401, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := store.Update([]rbac.File{{Name: "row.yaml", Data: []byte(tt.bindings)}}); err != nil {
+				t.Fatal(err)
+			}
+			bearer := ""
+			if tt.claims.user != "-" {
+				bearer = shared.issuer.token(tt.claims)
+			}
+			var got []api.Access
+			if code := getJSON(t, apiSrv, "/v1/access", bearer, &got); code != tt.code {
+				t.Fatalf("status %d, want %d", code, tt.code)
+			}
+			var entries []string
+			for _, a := range got {
+				entries = append(entries, a.Instance+"/"+a.Database+":"+a.Level)
+			}
+			if strings.Join(entries, ",") != tt.want {
+				t.Fatalf("access = %v, want %s", entries, tt.want)
+			}
+		})
+	}
+}
+
+func getJSON(t *testing.T, srv *httptest.Server, path, bearer string, v any) int {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return resp.StatusCode
+}
+
 func TestReleaseDropsRole(t *testing.T) {
 	ctx := context.Background()
 	admin, err := pgx.Connect(ctx, shared.adminDSN)
@@ -469,7 +546,7 @@ func TestReleaseDropsRole(t *testing.T) {
 	c := claims{}
 
 	t.Run("last close drops the role", func(t *testing.T) {
-		addr, _, _ := startServer(t, nil)
+		addr, _, _, _ := startServer(t, nil)
 		a, err := connect(ctx, addr, "cloudsql-main/order", c)
 		if err != nil {
 			t.Fatal(err)
@@ -492,7 +569,7 @@ func TestReleaseDropsRole(t *testing.T) {
 	})
 
 	t.Run("max connection age closes and drops", func(t *testing.T) {
-		addr, _, _ := startServer(t, func(cfg *config.Config) { cfg.MaxConnectionAge = config.Duration(300 * time.Millisecond) })
+		addr, _, _, _ := startServer(t, func(cfg *config.Config) { cfg.MaxConnectionAge = config.Duration(300 * time.Millisecond) })
 		conn, err := connect(ctx, addr, "cloudsql-main/order", c)
 		if err != nil {
 			t.Fatal(err)
@@ -552,7 +629,7 @@ func (m memStore) Set(k, v string) error        { m[k] = v; return nil }
 
 func TestConnector(t *testing.T) {
 	ctx := context.Background()
-	server, _, _ := startServer(t, nil)
+	server, _, _, _ := startServer(t, nil)
 	store := memStore{}
 	// startConnector serves two listeners from one connector: one without and one with an instance.
 	startConnector := func() (plain, onInstance string) {
