@@ -237,7 +237,9 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		cancel()
 		<-done
 	})
-	apiSrv := httptest.NewTLSServer(api.New(cfg, verifier, store).Handler())
+	apiSrv := httptest.NewUnstartedServer(api.New(cfg, verifier, store).Handler())
+	apiSrv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	apiSrv.StartTLS()
 	t.Cleanup(apiSrv.Close)
 	return ln.Addr().String(), store, audit, apiSrv
 }
@@ -626,6 +628,7 @@ type memStore map[string]string
 
 func (m memStore) Get(k string) (string, error) { return m[k], nil }
 func (m memStore) Set(k, v string) error        { m[k] = v; return nil }
+func (m memStore) Delete(k string) error        { delete(m, k); return nil }
 
 func TestConnector(t *testing.T) {
 	ctx := context.Background()
@@ -707,6 +710,84 @@ func TestConnector(t *testing.T) {
 	}
 	if l, r := counts(); l-logins0 != 1 || r-refreshes0 != 1 {
 		t.Fatalf("second connector: %d logins, %d refreshes; want the stored refresh token used", l-logins0, r-refreshes0)
+	}
+}
+
+// TestConnectorEnvironments runs a connector in environment mode against serve, with a token file
+// that changes between rows; the connector never restarts.
+func TestConnectorEnvironments(t *testing.T) {
+	ctx := context.Background()
+	server, _, _, apiSrv := startServer(t, nil)
+	dir := t.TempDir()
+	tokenFile, statusFile := filepath.Join(dir, "token.json"), filepath.Join(dir, "token.status")
+	f := &pgconnect.File{Environments: map[string]*pgconnect.EnvConfig{"test": {
+		Server: server, API: apiSrv.URL, ServerCA: shared.certFile,
+		Token: pgconnect.TokenConfig{File: tokenFile, Field: "access_token", StatusFile: statusFile},
+	}}}
+	if err := f.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	envs, err := f.BuildEnvs(pgconnect.BuildOptions{Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := pgconnect.NewRouter(envs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Go(func() { _ = router.Serve(cctx, ln) })
+	t.Cleanup(func() { cancel(); wg.Wait() })
+
+	writeToken := func(c *claims) {
+		if c == nil {
+			_ = os.Remove(tokenFile)
+			return
+		}
+		b, _ := json.Marshal(map[string]string{"access_token": shared.issuer.token(*c)})
+		if err := os.WriteFile(tokenFile, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(statusFile, []byte("Rapidata test is not connected: open Settings → Connections\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host, port, _ := net.SplitHostPort(ln.Addr().String())
+	tests := []struct {
+		name    string
+		token   *claims // nil: no token file
+		db      string
+		wantErr string // substring of the client's error; empty: SELECT works
+	}{
+		{"missing token file shows the status file", nil, "test/order", "Rapidata test is not connected: open Settings → Connections (SQLSTATE 28000)"},
+		{"token written later is picked up", &claims{}, "test/order", ""},
+		{"instance-qualified address", &claims{}, "test/cloudsql-main/assignment", ""},
+		{"bare database names the environments", &claims{}, "order", "use <env>/<db>; environments: test"},
+		{"unknown database", &claims{}, "test/billing", "test serves no database billing"},
+		{"no binding is reworded", &claims{user: "nobody@example.com"}, "test/order", "no access to test/order: no binding grants it (SQLSTATE 28000)"},
+		{"expired token shows the status file", &claims{expired: true}, "test/order", "Rapidata test is not connected"},
+		{"fixed again", &claims{}, "test/order", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeToken(tt.token)
+			conn, err := pgx.Connect(ctx, fmt.Sprintf("host=%s port=%s dbname=%s user=me sslmode=disable", host, port, tt.db))
+			if err == nil {
+				defer conn.Close(ctx)
+				_, err = conn.Exec(ctx, "SELECT count(*) FROM items")
+			}
+			if tt.wantErr == "" && err != nil || tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	e, _ := router.Env("test")
+	access, err := e.Access(ctx)
+	if err != nil || len(access) != 2 || access[0].Level != "read" {
+		t.Fatalf("access through the connector's token: %+v, %v", access, err)
 	}
 }
 

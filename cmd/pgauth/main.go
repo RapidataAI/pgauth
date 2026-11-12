@@ -35,7 +35,11 @@ const usage = `pgauth: Postgres access with short-lived OIDC tokens
 Usage:
   pgauth serve --config <file>          run the proxy
   pgauth lint [--config <file>] <dir>   check the PgRole / PgRoleBinding YAML in <dir>
-  pgauth connect [flags]                log in through the browser and serve localhost for Postgres clients
+  pgauth connect [--config <file>]      serve localhost for Postgres clients: dbname=<env>/<db>
+  pgauth ls [env]                       list the databases you can reach and your level
+  pgauth env add <name> <host> [--ca f] [--write] [--no-login] [--force]
+  pgauth env list | remove <name> | login <name>
+  pgauth service install | uninstall    run pgauth connect at login (launchd / systemd --user)
   pgauth version                 print the version
 `
 
@@ -52,6 +56,12 @@ func main() {
 		os.Exit(lint(os.Args[2:]))
 	case "connect":
 		err = connectCmd(os.Args[2:])
+	case "ls":
+		err = lsCmd(os.Args[2:])
+	case "env":
+		err = envCmd(os.Args[2:])
+	case "service":
+		err = serviceCmd(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:

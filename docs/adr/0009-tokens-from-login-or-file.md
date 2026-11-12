@@ -1,0 +1,3 @@
+# The connector gets tokens from a browser login or a file, never from a command
+
+A token source is either `login: browser` (PKCE, refresh token in the OS keychain per environment) or `file` (re-read on every connection, raw JWT or a JSON field), and connect.yaml cannot name a command to run. Running a configured command would turn a config file into code execution on every connection, and a file covers the other producers: whatever refreshes the token (an agent runtime, a sidecar) writes it, and a status file next to it explains a missing or expired token to the person or agent reading the error.

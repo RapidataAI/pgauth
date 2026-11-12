@@ -1,12 +1,21 @@
-# Defaults for `pgauth connect`; put this in <user config dir>/pgauth/connect.yaml. Flags override it.
-issuer: https://auth.example.com/
-clientId: pgauth-cli
-resource: https://postgres.example.com
-scope: openid offline_access postgres:read
-server: pgauth.example.com:5432
-# serverCA: /path/to/internal-ca.pem   # only when pgauth's certificate is not signed by a public CA
-listeners:             # one local port per instance; bare database names get "<instance>/"
-  - {listen: 127.0.0.1:15432, instance: main}
-  - {listen: 127.0.0.1:15433, instance: bidder}
-# listen: 127.0.0.1:5432  # a listener without instance: clients send "<instance>/<db>" themselves
-callbackPort: 8250     # login redirect http://127.0.0.1:8250/callback; 0 = any free port
+# pgauth connect: --config, else $PGAUTH_CONFIG, else <user config dir>/pgauth/connect.yaml.
+# `pgauth env add <name> <host>` writes an environment from the server's discovery.
+listen: 127.0.0.1:5432          # clients use dbname=<env>/<db> or <env>/<instance>/<db>
+# serverCA: /path/to/ca.pem     # when pgauth's certificate is not from a public CA; also per environment
+callbackPort: 8250              # browser login redirect http://127.0.0.1:8250/callback; 0 = any free port
+environments:
+  prod:
+    server: pgauth.example.com:5432
+    api: https://pgauth.example.com:8443          # default: https://<server host>:8443
+    token:                                        # pinned by `env add`; a changed issuer needs --force
+      login: browser
+      issuer: https://auth.example.com/
+      clientId: pgauth-cli
+      resource: https://postgres.example.com
+      scope: openid offline_access postgres:read
+  ci:
+    server: pgauth.example.com:5432
+    token:                                        # re-read on every connection; no command is ever run
+      file: /run/secrets/postgres-token.json
+      field: access_token                         # omit for a file holding the raw JWT
+      statusFile: /run/secrets/postgres-token.status   # shown to the client when the token is missing or expired
