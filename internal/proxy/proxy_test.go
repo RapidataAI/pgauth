@@ -494,7 +494,8 @@ func TestConnector(t *testing.T) {
 	ctx := context.Background()
 	server, _, _ := startServer(t, nil)
 	store := memStore{}
-	startConnector := func() string {
+	// startConnector serves two listeners from one connector: one without and one with an instance.
+	startConnector := func() (plain, onInstance string) {
 		c, err := pgconnect.New(pgconnect.Options{
 			Issuer: shared.issuer.srv.URL, ClientID: "pgauth-cli", Resource: audience, Scope: "openid offline_access",
 			Server: server, ServerCA: shared.certFile, Store: store,
@@ -510,15 +511,19 @@ func TestConnector(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
 		cctx, cancel := context.WithCancel(ctx)
-		done := make(chan struct{})
-		go func() { defer close(done); _ = c.Serve(cctx, ln) }()
-		t.Cleanup(func() { cancel(); <-done })
-		return ln.Addr().String()
+		var wg sync.WaitGroup
+		t.Cleanup(func() { cancel(); wg.Wait() })
+		addrs := make([]string, 2)
+		for i, instance := range []string{"", instanceName} {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			addrs[i] = ln.Addr().String()
+			wg.Go(func() { _ = c.Serve(cctx, ln, instance) })
+		}
+		return addrs[0], addrs[1]
 	}
 	query := func(addr, db string) (string, error) {
 		host, port, _ := net.SplitHostPort(addr)
@@ -538,20 +543,28 @@ func TestConnector(t *testing.T) {
 	}
 	logins0, refreshes0 := counts()
 
-	first := startConnector()
-	for range 2 {
-		if user, err := query(first, "cloudsql-main/order"); err != nil || !strings.HasPrefix(user, "pgauth_") {
-			t.Fatalf("query through connector: user %q, err %v", user, err)
+	first, firstInstance := startConnector()
+	for _, q := range []struct{ addr, db string }{
+		{first, "cloudsql-main/order"},
+		{first, "cloudsql-main/order"},
+		{firstInstance, "order"},
+		{firstInstance, "cloudsql-main/assignment"},
+	} {
+		if user, err := query(q.addr, q.db); err != nil || !strings.HasPrefix(user, "pgauth_") {
+			t.Fatalf("query %s through connector: user %q, err %v", q.db, user, err)
 		}
+	}
+	if _, err := query(first, "order"); err == nil || !strings.Contains(err.Error(), "<instance>/<db>") {
+		t.Fatalf("a bare name on a listener without instance must reach pgauth unchanged, got %v", err)
 	}
 	if _, err := query(first, "cloudsql-main/postgres"); err == nil || !strings.Contains(err.Error(), "not served") {
 		t.Fatalf("want pgauth's denial passed through, got %v", err)
 	}
 	if l, r := counts(); l-logins0 != 1 || r-refreshes0 != 0 {
-		t.Fatalf("first connector: %d logins, %d refreshes; want one login reused for every connection", l-logins0, r-refreshes0)
+		t.Fatalf("first connector: %d logins, %d refreshes; want one login shared by both listeners", l-logins0, r-refreshes0)
 	}
 
-	second := startConnector()
+	second, _ := startConnector()
 	if _, err := query(second, "cloudsql-main/order"); err != nil {
 		t.Fatal(err)
 	}

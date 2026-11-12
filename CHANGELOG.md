@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.0
+
+- `pgauth connect` takes `listeners`, one local port per instance: a bare database name on an instance listener becomes `<instance>/<db>`, so IDEs such as DataGrip and Rider can browse an instance as one data source. All listeners share one login. The top-level `listen` keeps working unchanged; `--instance` gives `--listen` an instance. Each connection logs its database, e.g. `order → cloudsql-main/order`. `pgauth serve` is unchanged.
+
 ## v0.3.2
 
 - The connect log line and span carry `granted` (the level from the bindings, before the scope cap) next to `level` (effective), so the audit shows when a scope reduced write to read.
