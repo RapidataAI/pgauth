@@ -30,10 +30,16 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/RapidataAI/pgauth/internal/config"
 	pgconnect "github.com/RapidataAI/pgauth/internal/connect"
 	"github.com/RapidataAI/pgauth/internal/rbac"
+	"github.com/RapidataAI/pgauth/internal/telemetry"
 	"github.com/RapidataAI/pgauth/internal/token"
 )
 
@@ -88,6 +94,7 @@ var shared *env
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider())
 	pg, err := tcpostgres.Run(ctx, "postgres:18",
 		tcpostgres.WithUsername("postgres"), tcpostgres.WithPassword("postgres"), tcpostgres.BasicWaitStrategies())
 	if err != nil {
@@ -195,7 +202,7 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	audit := &auditLog{}
-	log := slog.New(slog.NewJSONHandler(audit, nil))
+	log := telemetry.Logger(audit, sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewSimpleProcessor(audit))))
 	verifier := token.NewVerifier(cfg.OIDC)
 	go verifier.Start(ctx, log)
 	cert, err := tls.LoadX509KeyPair(shared.certFile, shared.keyFile)
@@ -232,10 +239,44 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 }
 
 // auditLog keeps the server's JSON log lines so tests can read the connect record.
+// auditLog keeps the connect records twice: as stdout JSON lines and as OpenTelemetry log records,
+// the two outputs of telemetry.Logger.
 type auditLog struct {
 	mu    sync.Mutex
 	lines []map[string]any
+	otel  []map[string]any
 }
+
+func (l *auditLog) Export(_ context.Context, records []sdklog.Record) error {
+	for _, r := range records {
+		if r.Body().Emit() != "connect" {
+			continue
+		}
+		rec := map[string]any{"trace_id": r.TraceID()}
+		r.WalkAttributes(func(kv attribute.KeyValue) bool {
+			switch kv.Value.Type() {
+			case attribute.STRINGSLICE:
+				rec[string(kv.Key)] = strings.Join(kv.Value.AsStringSlice(), ",")
+			case attribute.SLICE:
+				var items []string
+				for _, v := range kv.Value.AsSlice() {
+					items = append(items, v.Emit())
+				}
+				rec[string(kv.Key)] = strings.Join(items, ",")
+			default:
+				rec[string(kv.Key)] = kv.Value.Emit()
+			}
+			return true
+		})
+		l.mu.Lock()
+		l.otel = append(l.otel, rec)
+		l.mu.Unlock()
+	}
+	return nil
+}
+
+func (l *auditLog) Shutdown(context.Context) error   { return nil }
+func (l *auditLog) ForceFlush(context.Context) error { return nil }
 
 func (l *auditLog) Write(p []byte) (int, error) {
 	var line map[string]any
@@ -253,20 +294,21 @@ func (l *auditLog) count() int {
 	return len(l.lines)
 }
 
-// after waits for the first connect record past index n; it is written just after the client is greeted.
-func (l *auditLog) after(t *testing.T, n int) map[string]any {
+// after waits for the connect record past index n in both outputs; it is written just after the
+// client is greeted.
+func (l *auditLog) after(t *testing.T, n int) (jsonLine, otelRecord map[string]any) {
 	t.Helper()
 	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
 		l.mu.Lock()
-		if len(l.lines) > n {
-			line := l.lines[n]
+		if len(l.lines) > n && len(l.otel) > n {
+			jsonLine, otelRecord = l.lines[n], l.otel[n]
 			l.mu.Unlock()
-			return line
+			return jsonLine, otelRecord
 		}
 		l.mu.Unlock()
 	}
 	t.Fatal("no connect log record")
-	return nil
+	return nil, nil
 }
 
 type claims struct {
@@ -364,9 +406,27 @@ func TestConnect(t *testing.T) {
 				t.Fatalf("connect error = %v, want connect %v", err, tt.wantConnect)
 			}
 			if tt.wantAudit != "" {
-				r := audit.after(t, logged)
-				if got := fmt.Sprintf("%v/%v/%v", r["granted"], r["level"], r["scope_cap"]); got != tt.wantAudit {
-					t.Errorf("granted/level/scope_cap = %s, want %s", got, tt.wantAudit)
+				j, o := audit.after(t, logged)
+				if got := fmt.Sprintf("%v/%v/%v", j["granted"], j["level"], j["scope_cap"]); got != tt.wantAudit {
+					t.Errorf("JSON granted/level/scope_cap = %s, want %s", got, tt.wantAudit)
+				}
+				if got := fmt.Sprintf("%v/%v/%v", o["granted"], o["level"], o["scope_cap"]); got != tt.wantAudit {
+					t.Errorf("OTel granted/level/scope_cap = %s, want %s", got, tt.wantAudit)
+				}
+				var bindings []string
+				for _, b := range j["bindings"].([]any) {
+					bindings = append(bindings, b.(string))
+				}
+				for _, k := range []string{"user", "decision"} {
+					if o[k] != j[k] || o[k] == "" {
+						t.Errorf("OTel %s = %v, want %v", k, o[k], j[k])
+					}
+				}
+				if want := strings.Join(bindings, ","); o["bindings"] != want || want == "" {
+					t.Errorf("OTel bindings = %v, want %v", o["bindings"], want)
+				}
+				if id, _ := o["trace_id"].(trace.TraceID); !id.IsValid() {
+					t.Error("OTel connect record carries no trace id")
 				}
 			}
 			if err != nil {

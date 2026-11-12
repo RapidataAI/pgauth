@@ -246,7 +246,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 			span.SetStatus(codes.Error, reason)
 		}
 		span.End()
-		s.log.Info("connect", "sub", a.sub, "user", a.user, "groups", a.groups, "client_id", a.clientID,
+		s.log.InfoContext(ctx, "connect", "sub", a.sub, "user", a.user, "groups", a.groups, "client_id", a.clientID,
 			"instance", a.instance, "db", a.db, "bindings", a.bindings, "granted", a.granted, "level", a.level, "scope_cap", a.scopeCap,
 			"decision", decision, "reason", reason, "role", a.role, "duration_ms", d.Milliseconds())
 	}

@@ -4,6 +4,7 @@
 
 - A rules file with no `PgRole` or `PgRoleBinding` (empty or only comments) is invalid, in `pgauth lint` and at runtime: a file read empty mid-write no longer replaces the live set with zero bindings. Delete a file instead of emptying it.
 - Reloads wait for two identical reads 100 ms apart before loading a change, so a file edited in place is not loaded half-written.
+- `pgauth serve` exports its logs over OTLP (slog bridged to OpenTelemetry logs) next to traces and metrics, with the same `OTEL_EXPORTER_OTLP_*` settings and `service.name`; `OTEL_LOGS_EXPORTER=none` turns it off. Stdout JSON stays. The connect record carries its span's trace and span ids. `pgauth connect` still logs text to stderr only.
 
 ## v0.4.0
 

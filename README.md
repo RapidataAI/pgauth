@@ -156,8 +156,11 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
   (and its startup sweep ran); its body reports a rejected rules change.
 - **Audit:** every connection attempt writes one JSON log line and one OpenTelemetry span
   `pgauth.connect` with `sub`, `user`, `groups`, `client_id`, `instance`, `db`, `bindings`, `granted`
-  (level from the bindings), `level` (after the cap), `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded. Spans and
-  metrics are exported when the standard `OTEL_EXPORTER_OTLP_*` variables are set.
+  (level from the bindings), `level` (after the cap), `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded.
+- **Telemetry:** when the standard `OTEL_EXPORTER_OTLP_*` variables are set, spans, metrics and logs
+  go out over OTLP with `service.name=pgauth`; `OTEL_LOGS_EXPORTER=none` (or `_TRACES_` / `_METRICS_`)
+  switches one signal off. Every log line still goes to stdout as JSON as well, and the connect record
+  carries the trace and span ids of its `pgauth.connect` span.
 
 ### Multiple replicas
 
