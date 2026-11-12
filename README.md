@@ -182,9 +182,34 @@ psql "host=127.0.0.1 dbname=main/orders"
 
 The flags can live in `connect.yaml` under your user config directory (`~/Library/Application
 Support/pgauth/` on macOS, `~/.config/pgauth/` on Linux) as `issuer`, `clientId`, `resource`, `scope`,
-`server`, `serverCA`, `listen` and `callbackPort`; see [`connect.example.yaml`](connect.example.yaml) and, for one
+`server`, `serverCA`, `listen`, `listeners` and `callbackPort`; see [`connect.example.yaml`](connect.example.yaml) and, for one
 real deployment, [`examples/rapidata-test/connect.yaml`](examples/rapidata-test/connect.yaml). Any process of yours that can reach the local port connects with
 your rights, the same trade-off as other local database proxies.
+
+### Listeners per instance
+
+`listeners` opens one local port per instance. On a listener that names an instance, a bare database
+name becomes `<instance>/<db>` before it reaches pgauth; a name that already has a `/` passes through.
+All listeners share one login and one refresh token. The top-level `listen` (or `--listen`, with an
+optional `--instance`) is a listener without an instance, as before.
+
+```yaml
+listeners:
+  - {listen: 127.0.0.1:15432, instance: main}
+  - {listen: 127.0.0.1:15433, instance: bidder}
+```
+
+```
+psql "host=127.0.0.1 port=15432 dbname=orders"   # pgauth sees main/orders
+```
+
+### IDEs (DataGrip/Rider)
+
+Create one data source per instance, each pointing at that instance's listener port (`127.0.0.1:15432`
+for `main` above), with any user, no password and SSL off: the connector adds the token and pgauth's
+TLS. The IDE lists every database it finds in `pg_database` and opens one connection per database
+name, which the listener turns into `<instance>/<db>`. Databases pgauth does not serve fail with
+`not served`; to keep the IDE quiet, limit the data source's **Schemas** tab to the databases you use.
 
 Binaries for macOS (arm64, amd64) and Linux (amd64, arm64) are attached to each
 [GitHub release](https://github.com/RapidataAI/pgauth/releases). A binary downloaded with a browser

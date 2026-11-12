@@ -1,10 +1,11 @@
 # Rapidata test environment (VPN). Copy to ~/Library/Application Support/pgauth/connect.yaml (macOS)
-# or ~/.config/pgauth/connect.yaml (Linux), run `pgauth connect`, then `psql "host=127.0.0.1 dbname=cloudsql-main/order"`.
+# or ~/.config/pgauth/connect.yaml (Linux), run `pgauth connect`, then `psql "host=127.0.0.1 port=15432 dbname=order"`.
+# DataGrip/Rider: one data source on 127.0.0.1:15432, no password, SSL off.
 issuer: https://auth.rabbitdata.ch/
 clientId: pgauth-cli
 resource: https://postgres.rabbitdata.ch
 scope: openid offline_access postgres:read   # postgres:write for writes, if you hold a writer grant
 server: pgauth.rabbitdata.internal:5432
 # serverCA: /path/to/rapidata-internal-ca.pem   # if the internal CA is not in your system trust store
-listen: 127.0.0.1:5432
+listeners: [{listen: 127.0.0.1:15432, instance: cloudsql-main}]
 callbackPort: 8250     # login redirect http://127.0.0.1:8250/callback; 0 = any free port

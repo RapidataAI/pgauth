@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +29,6 @@ type Options struct {
 	// Server is pgauth's host:port; ServerCA is a PEM file to trust instead of the system roots.
 	Server   string
 	ServerCA string
-	Listen   string
 	// CallbackPort is the loopback port of the login redirect; 0 picks a free one (RFC 8252).
 	CallbackPort int
 	// OpenBrowser opens the login URL; the URL is also logged in case it fails.
@@ -129,8 +129,59 @@ func (c *Connector) Token(ctx context.Context) (string, error) {
 	return c.access, nil
 }
 
-// Serve accepts local connections until ctx ends.
-func (c *Connector) Serve(ctx context.Context, ln net.Listener) error {
+// Listener is one local address; with an Instance, bare database names are taken to be on it.
+type Listener struct {
+	Listen   string `json:"listen"`
+	Instance string `json:"instance"`
+}
+
+// TargetDatabase is the database pgauth is asked for: a bare name gets "<instance>/" when the
+// listener names an instance, anything else passes through.
+func TargetDatabase(instance, db string) string {
+	if instance == "" || db == "" || strings.Contains(db, "/") {
+		return db
+	}
+	return instance + "/" + db
+}
+
+// ServeAll listens on every listener and serves them with this Connector's one token until ctx
+// ends or a listener fails.
+func (c *Connector) ServeAll(ctx context.Context, listeners []Listener) error {
+	lns := make([]net.Listener, 0, len(listeners))
+	defer func() {
+		for _, ln := range lns {
+			ln.Close()
+		}
+	}()
+	for _, l := range listeners {
+		ln, err := net.Listen("tcp", l.Listen)
+		if err != nil {
+			return err
+		}
+		lns = append(lns, ln)
+		host, port, _ := net.SplitHostPort(ln.Addr().String())
+		db := "<instance>/<db>"
+		if l.Instance != "" {
+			db = "<db>"
+		}
+		c.log.Info("ready", "instance", l.Instance, "connect", fmt.Sprintf(`psql "host=%s port=%s dbname=%s"`, host, port, db))
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make(chan error, len(lns))
+	for i, ln := range lns {
+		go func() { errs <- c.Serve(ctx, ln, listeners[i].Instance) }()
+	}
+	err := <-errs
+	cancel()
+	for range len(lns) - 1 {
+		<-errs
+	}
+	return err
+}
+
+// Serve accepts local connections on ln until ctx ends; instance is the listener's instance, if any.
+func (c *Connector) Serve(ctx context.Context, ln net.Listener, instance string) error {
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -148,12 +199,12 @@ func (c *Connector) Serve(ctx context.Context, ln net.Listener) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.handle(ctx, conn)
+			c.handle(ctx, conn, instance)
 		}()
 	}
 }
 
-func (c *Connector) handle(ctx context.Context, conn net.Conn) {
+func (c *Connector) handle(ctx context.Context, conn net.Conn, instance string) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Minute))
 	backend := pgproto3.NewBackend(conn, conn)
@@ -174,6 +225,14 @@ func (c *Connector) handle(ctx context.Context, conn net.Conn) {
 		case *pgproto3.StartupMessage:
 			startup = msg
 		}
+	}
+
+	db := startup.Parameters["database"]
+	if target := TargetDatabase(instance, db); target != db {
+		startup.Parameters["database"] = target
+		c.log.Info("connection", "database", db+" → "+target)
+	} else {
+		c.log.Info("connection", "database", db)
 	}
 
 	token, err := c.Token(ctx)
