@@ -164,7 +164,9 @@ func (r *Router) Serve(ctx context.Context, ln net.Listener, env string) error {
 	f := &forwarder{log: r.log, route: func(ctx context.Context, database string) (target, error) {
 		resolve := r.Resolve
 		if env != "" {
-			resolve = func(ctx context.Context, database string) (*Env, string, error) { return r.ResolveOn(ctx, env, database) }
+			resolve = func(ctx context.Context, database string) (*Env, string, error) {
+				return r.ResolveOn(ctx, env, database)
+			}
 		}
 		e, db, err := resolve(ctx, database)
 		if err != nil {
