@@ -110,6 +110,7 @@ func Parse(files []File) (*Resources, Errors) {
 	var errs Errors
 	for _, f := range files {
 		dec := yaml.NewDecoder(bytes.NewReader(f.Data))
+		objects, broken := 0, false
 		for {
 			var doc yaml.Node
 			err := dec.Decode(&doc)
@@ -118,14 +119,20 @@ func Parse(files []File) (*Resources, Errors) {
 			}
 			if err != nil {
 				errs = append(errs, Error{Pos{f.Name, yamlErrLine(err)}, err.Error()})
+				broken = true
 				break
 			}
 			if len(doc.Content) == 0 || doc.Content[0].Tag == "!!null" {
 				continue
 			}
+			objects++
 			p := &parser{file: f.Name}
 			p.object(doc.Content[0], res)
 			errs = append(errs, p.errs...)
+		}
+		// A file caught mid-write reads as empty; rejecting it keeps the last valid set live.
+		if objects == 0 && !broken {
+			errs = append(errs, Error{Pos{f.Name, 1}, "file has no PgRole or PgRoleBinding; delete it instead of emptying it"})
 		}
 	}
 	return res, errs

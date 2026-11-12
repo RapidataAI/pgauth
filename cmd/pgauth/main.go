@@ -16,17 +16,14 @@ import (
 	"syscall"
 	"time"
 
-	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/RapidataAI/pgauth/internal/config"
 	"github.com/RapidataAI/pgauth/internal/proxy"
 	"github.com/RapidataAI/pgauth/internal/rbac"
+	"github.com/RapidataAI/pgauth/internal/telemetry"
 	"github.com/RapidataAI/pgauth/internal/token"
 )
 
@@ -71,7 +68,7 @@ func serve(args []string) error {
 	path := fs.String("config", "/etc/pgauth/config.yaml", "path to the config file")
 	_ = fs.Parse(args)
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := telemetry.Logger(os.Stdout, nil)
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
@@ -79,11 +76,12 @@ func serve(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	shutdownTelemetry, err := setupTelemetry(ctx)
+	shutdownTelemetry, logs, err := telemetry.Setup(ctx)
 	if err != nil {
 		return err
 	}
 	defer shutdownTelemetry()
+	log = telemetry.Logger(os.Stdout, logs)
 
 	certs := &certReloader{certFile: cfg.TLS.CertFile, keyFile: cfg.TLS.KeyFile}
 	if _, err := certs.get(nil); err != nil {
@@ -160,39 +158,6 @@ func serveHealth(ctx context.Context, addr string, srv *proxy.Server, store *rba
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("health server", "error", err)
 	}
-}
-
-// setupTelemetry exports spans and metrics only when an OTLP endpoint is set through the standard env vars.
-func setupTelemetry(ctx context.Context) (func(), error) {
-	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" && os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") == "" &&
-		os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") == "" {
-		return func() {}, nil
-	}
-	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(attribute.String("service.name", "pgauth")))
-	if err != nil {
-		return nil, err
-	}
-	if res, err = resource.Merge(res, resource.Environment()); err != nil {
-		return nil, err
-	}
-	spans, err := autoexport.NewSpanExporter(ctx)
-	if err != nil {
-		return nil, err
-	}
-	metrics, err := autoexport.NewMetricReader(ctx)
-	if err != nil {
-		return nil, err
-	}
-	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(spans), sdktrace.WithResource(res))
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics), sdkmetric.WithResource(res))
-	otel.SetTracerProvider(tp)
-	otel.SetMeterProvider(mp)
-	return func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = tp.Shutdown(ctx)
-		_ = mp.Shutdown(ctx)
-	}, nil
 }
 
 // certReloader rereads the certificate when its file changes, so a renewed certificate needs no restart.

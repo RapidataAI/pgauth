@@ -54,6 +54,9 @@ type Store struct {
 	log       *slog.Logger
 	// OnLoad is called after every load attempt that saw changed input.
 	OnLoad func(err error)
+	// Settle is how long WatchDir waits for a second identical read before it loads a change.
+	Settle time.Duration
+	sleep  func(time.Duration)
 
 	policy atomic.Pointer[Policy]
 	mu     sync.Mutex
@@ -69,7 +72,7 @@ type Status struct {
 }
 
 func NewStore(instances Instances, log *slog.Logger) *Store {
-	return &Store{instances: instances, log: log}
+	return &Store{instances: instances, log: log, Settle: 100 * time.Millisecond, sleep: time.Sleep}
 }
 
 func (s *Store) Policy() *Policy { return s.policy.Load() }
@@ -82,14 +85,7 @@ func (s *Store) Status() Status {
 
 // Update compiles files and makes them live if they are valid and differ from the last input.
 func (s *Store) Update(files []File) error {
-	h := sha256.New()
-	for _, f := range files {
-		h.Write([]byte(f.Name + "\x00"))
-		h.Write(f.Data)
-		h.Write([]byte{0})
-	}
-	var digest [32]byte
-	copy(digest[:], h.Sum(nil))
+	digest := digestOf(files)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -115,13 +111,46 @@ func (s *Store) Update(files []File) error {
 	return err
 }
 
+func digestOf(files []File) [32]byte {
+	h := sha256.New()
+	for _, f := range files {
+		h.Write([]byte(f.Name + "\x00"))
+		h.Write(f.Data)
+		h.Write([]byte{0})
+	}
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+	return digest
+}
+
+// readSettled reads dir twice, Settle apart, when it changed since the last load, and returns the
+// files only if both reads agree; a file still being written is picked up on a later tick.
+func (s *Store) readSettled(dir string) ([]File, bool, error) {
+	files, err := ReadDir(dir)
+	if err != nil {
+		return nil, false, err
+	}
+	s.mu.Lock()
+	unchanged := (s.status.Loaded || s.status.Rejected != nil) && digestOf(files) == s.digest
+	s.mu.Unlock()
+	if unchanged || s.Settle <= 0 {
+		return files, true, nil
+	}
+	s.sleep(s.Settle)
+	again, err := ReadDir(dir)
+	if err != nil {
+		return nil, false, err
+	}
+	return again, digestOf(again) == digestOf(files), nil
+}
+
 // WatchDir loads dir now and again every interval until ctx ends.
 func (s *Store) WatchDir(ctx context.Context, dir string, interval time.Duration) {
 	for {
-		files, err := ReadDir(dir)
-		if err == nil {
+		files, settled, err := s.readSettled(dir)
+		if err == nil && settled {
 			_ = s.Update(files)
-		} else {
+		} else if err != nil {
 			err = errors.Join(errors.New("read "+dir), err)
 			s.mu.Lock()
 			s.status.Rejected, s.status.RejectedAt = err, time.Now()

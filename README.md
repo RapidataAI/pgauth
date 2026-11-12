@@ -79,8 +79,11 @@ spec:
 - **Scope cap.** After the bindings, the token's scope caps the level: `postgres:read` caps at read,
   `postgres:write` allows write, a token with neither is refused (`oidc.scopes` renames them). This is
   how a token issued to an agent stays read-only although its owner may write.
-- **Reloading.** pgauth rereads the directory every `rbac.reloadInterval` (10s). A set with any error
-  is rejected as a whole and the last valid set stays live; the rejection is logged, counted in the
+- **Reloading.** pgauth rereads the directory every `rbac.reloadInterval` (10s) and loads a change
+  only after two identical reads 100 ms apart, so a file being written is picked up once it is
+  complete. A set with any error is rejected as a whole and the last valid set stays live; a file with
+  no `PgRole` or `PgRoleBinding` (for example one caught empty mid-write) counts as an error, so
+  delete a file rather than emptying it; the rejection is logged, counted in the
   `pgauth.rbac.loads{result="rejected"}` metric, flagged by the `pgauth.rbac.rejected` gauge and shown
   in the `/readyz` body. pgauth becomes ready only once a first valid set has loaded.
 - **Lint in CI.** `pgauth lint [--config config.yaml] <dir>` checks the schema, unknown fields,
@@ -153,8 +156,11 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
   (and its startup sweep ran); its body reports a rejected rules change.
 - **Audit:** every connection attempt writes one JSON log line and one OpenTelemetry span
   `pgauth.connect` with `sub`, `user`, `groups`, `client_id`, `instance`, `db`, `bindings`, `granted`
-  (level from the bindings), `level` (after the cap), `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded. Spans and
-  metrics are exported when the standard `OTEL_EXPORTER_OTLP_*` variables are set.
+  (level from the bindings), `level` (after the cap), `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded.
+- **Telemetry:** when the standard `OTEL_EXPORTER_OTLP_*` variables are set, spans, metrics and logs
+  go out over OTLP with `service.name=pgauth`; `OTEL_LOGS_EXPORTER=none` (or `_TRACES_` / `_METRICS_`)
+  switches one signal off. Every log line still goes to stdout as JSON as well, and the connect record
+  carries the trace and span ids of its `pgauth.connect` span.
 
 ### Multiple replicas
 

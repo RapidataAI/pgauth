@@ -94,6 +94,8 @@ spec:
   subjects:
     - {kind: ServiceAccount, name: a}
 `, instances, []string{"a.yaml:4: spec.grants[].level must be read or write", "a.yaml:12: spec.subjects[].kind must be User or Group"}, nil},
+		{"empty file", "", instances, []string{"a.yaml:1: file has no PgRole or PgRoleBinding"}, nil},
+		{"file with only comments", "# bindings go here\n---\n", instances, []string{"a.yaml:1: file has no PgRole or PgRoleBinding"}, nil},
 		{"broken YAML", header + "kind: PgRole\nmetadata: {name: x\n", instances, []string{"a.yaml:2: yaml: line 2:"}, nil},
 		{"without a config, instances and generated roles are not checked", header + `kind: PgRole
 metadata: {name: x}
@@ -157,6 +159,38 @@ func TestUserMatching(t *testing.T) {
 	}
 }
 
+func TestReloadWaitsForFilesToSettle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bindings.yaml")
+	write := func(user string) {
+		b := header + "kind: PgRoleBinding\nmetadata: {name: mari}\nspec:\n  roleRef: {kind: PgRole, name: pg-reader}\n" +
+			"  subjects: [{kind: User, name: " + user + "}]\n"
+		if err := os.WriteFile(path, []byte(b), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := NewStore(instances, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	write("first@example.com")
+
+	// The file changes between the two reads: not settled, nothing to load yet.
+	store.sleep = func(time.Duration) { write("second@example.com") }
+	if _, settled, err := store.readSettled(dir); err != nil || settled {
+		t.Fatalf("settled = %v, err %v; want a changing file left for the next tick", settled, err)
+	}
+
+	store.sleep = func(time.Duration) {}
+	files, settled, err := store.readSettled(dir)
+	if err != nil || !settled {
+		t.Fatalf("settled = %v, err %v; want two identical reads to settle", settled, err)
+	}
+	if err := store.Update(files); err != nil {
+		t.Fatal(err)
+	}
+	if l, _ := store.Policy().Access(Who{User: "second@example.com"}, "cloudsql-main", "order"); l != Read {
+		t.Fatalf("level = %v, want read from the settled file", l)
+	}
+}
+
 func TestLastValidWins(t *testing.T) {
 	dir := t.TempDir()
 	// Replace the file atomically, as a ConfigMap update does: an in-place write can be read while
@@ -207,6 +241,14 @@ func TestLastValidWins(t *testing.T) {
 	if level(store) != Read {
 		t.Fatalf("level = %v, want read", level(store))
 	}
+
+	write("")
+	waitFor("the emptied file to be rejected", func() bool { return store.Status().Rejected != nil })
+	if level(store) != Read {
+		t.Fatalf("after emptying the file: level %v, want the previous set (read) still live", level(store))
+	}
+	write(bindTo("cloudsql-main.order.read"))
+	waitFor("the restored set to clear the rejection", func() bool { return store.Status().Rejected == nil })
 
 	write(bindTo("pg-admin") + "  extra: field\n")
 	waitFor("the bad change to be rejected", func() bool { return store.Status().Rejected != nil })
