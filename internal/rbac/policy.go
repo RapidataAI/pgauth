@@ -102,6 +102,17 @@ func builtinRoles(instances Instances) []*Role {
 	return out
 }
 
+// ScopeCap is the highest level a token's scopes allow: write, read, or none without either scope.
+func ScopeCap(tokenScopes []string, readScope, writeScope string) Level {
+	switch {
+	case slices.Contains(tokenScopes, writeScope):
+		return Write
+	case slices.Contains(tokenScopes, readScope):
+		return Read
+	}
+	return None
+}
+
 // Who is the holder a binding is matched against.
 type Who struct {
 	User   string

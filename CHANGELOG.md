@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.0
+
+- `pgauth serve` has an HTTPS listener (`http.listen`, Postgres certificate) with `GET /.well-known/pgauth` (discovery, new `discovery.cliClientId` / `discovery.postgres`) and `GET /v1/access` (the token's databases and levels).
+
 ## v0.4.1
 
 - A rules file with no `PgRole` or `PgRoleBinding` (empty or only comments) is invalid, in `pgauth lint` and at runtime: a file read empty mid-write no longer replaces the live set with zero bindings. Delete a file instead of emptying it.

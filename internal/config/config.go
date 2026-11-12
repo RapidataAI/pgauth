@@ -18,9 +18,12 @@ type Config struct {
 	Listen string `json:"listen"`
 	// Health serves GET /healthz and /readyz; empty disables it.
 	Health string `json:"health"`
-	TLS    TLS    `json:"tls"`
-	OIDC   OIDC   `json:"oidc"`
-	RBAC   RBAC   `json:"rbac"`
+	// HTTP serves discovery and access over HTTPS with the Postgres certificate; empty disables it.
+	HTTP      HTTP      `json:"http"`
+	Discovery Discovery `json:"discovery"`
+	TLS       TLS       `json:"tls"`
+	OIDC      OIDC      `json:"oidc"`
+	RBAC      RBAC      `json:"rbac"`
 	// GroupRoles names the Postgres group role per access level; "{db}" is replaced by the database name.
 	GroupRoles GroupRoles `json:"groupRoles"`
 	// TempGroup marks every temporary role so pgauth can find and sweep them.
@@ -34,6 +37,18 @@ type Config struct {
 type TLS struct {
 	CertFile string `json:"certFile"`
 	KeyFile  string `json:"keyFile"`
+}
+
+type HTTP struct {
+	Listen string `json:"listen"`
+}
+
+// Discovery is what GET /.well-known/pgauth tells a connector beyond the OIDC settings.
+type Discovery struct {
+	// CLIClientID is the public OIDC client people log in with.
+	CLIClientID string `json:"cliClientId"`
+	// Postgres is the address clients reach the Postgres port at; default: the request's host and the listen port.
+	Postgres string `json:"postgres"`
 }
 
 type RBAC struct {

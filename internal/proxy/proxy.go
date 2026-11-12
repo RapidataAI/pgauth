@@ -13,7 +13,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -363,12 +362,7 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 	}
 	who := rbac.Who{User: claims.Username, Groups: claims.Groups, FoldUser: s.cfg.OIDC.FoldUsername()}
 	d.granted, d.bindings = policy.Access(who, instName, db)
-	switch {
-	case slices.Contains(claims.Scopes, s.cfg.OIDC.Scopes.Write):
-		d.scopeCap = rbac.Write
-	case slices.Contains(claims.Scopes, s.cfg.OIDC.Scopes.Read):
-		d.scopeCap = rbac.Read
-	}
+	d.scopeCap = rbac.ScopeCap(claims.Scopes, s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)
 	d.level = min(d.granted, d.scopeCap)
 	switch {
 	case d.granted == rbac.None:
