@@ -44,6 +44,14 @@ _Avoid_: session check, re-validation
 The local program a person runs (`pgauth connect`) that logs them in through the browser and lets any Postgres client reach pgauth through `localhost`.
 _Avoid_: helper, CLI, local proxy
 
+**Environment**:
+One pgauth deployment a connector reaches, such as prod or test, with its own server and token source. It is the first segment of a database address.
+_Avoid_: profile, context, cluster
+
+**Database address**:
+The database name a client asks the connector for: `<env>/<db>` or `<env>/<instance>/<db>`. There is no default environment.
+_Avoid_: DSN, connection name
+
 **Instance**:
 One Postgres server pgauth can reach, such as the main Cloud SQL or the bidder cluster's Postgres. Database names are only unique within an instance.
 _Avoid_: server, cluster, host

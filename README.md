@@ -178,49 +178,58 @@ closed on a pod that then crashed stays until some pod restarts and sweeps it.
 
 ## Connecting as a person
 
-`pgauth connect` is the connector: it logs you in through the browser (authorization code + PKCE
-against a public OIDC client; the redirect is `http://127.0.0.1:8250/callback`, set by
-`--callback-port`, and port 0 picks a free port for issuers that accept any loopback port per RFC 8252), keeps the refresh token
-in the OS keychain (macOS Keychain, Secret Service on Linux), and listens on `127.0.0.1:5432`. Every
-connection a local client opens is forwarded to pgauth over TLS with a fresh token as the password.
+`pgauth connect` is the connector. It listens on `127.0.0.1:5432` and forwards every client
+connection to the right pgauth over TLS, with a fresh token as the password. The database name is
+the address ([ADR 0010](docs/adr/0010-database-name-is-the-address.md)):
 
 ```
-pgauth connect --issuer https://auth.example.com --client-id pgauth-cli \
-  --resource https://postgres.example.com --scope "openid offline_access postgres:read" \
-  --server pgauth.example.com:5432 [--server-ca internal-ca.pem] [--listen 127.0.0.1:5432]
-psql "host=127.0.0.1 dbname=main/orders"
+psql "host=127.0.0.1 dbname=prod/order"                # <env>/<db>, the instance is looked up
+psql "host=127.0.0.1 dbname=prod/cloudsql-main/order"  # <env>/<instance>/<db>
 ```
 
-The flags can live in `connect.yaml` under your user config directory (`~/Library/Application
-Support/pgauth/` on macOS, `~/.config/pgauth/` on Linux) as `issuer`, `clientId`, `resource`, `scope`,
-`server`, `serverCA`, `listen`, `listeners` and `callbackPort`; see [`connect.example.yaml`](connect.example.yaml) and, for one
-real deployment, [`examples/rapidata-test/connect.yaml`](examples/rapidata-test/connect.yaml). Any process of yours that can reach the local port connects with
-your rights, the same trade-off as other local database proxies.
+There is no default environment: a bare `order` fails with `use <env>/<db>; environments: prod,
+test`, and a name on several instances fails and lists the full addresses.
 
-### Listeners per instance
+1. `pgauth env add prod pgauth.example.com` reads the server's discovery
+   (`https://<host>:8443/.well-known/pgauth`), pins its issuer and CLI client in `connect.yaml`, logs
+   you in through the browser and lists what you can reach. `--write` asks for the write scope,
+   `--ca file` trusts a private CA, `--ide-port` adds an IDE port (below), `--no-login` skips the login. Adding an environment again with a
+   different issuer is refused without `--force`.
+2. `pgauth connect`, or `pgauth service install` to run it at login (launchd on macOS, a systemd user
+   unit on Linux; `service uninstall` removes it).
+3. `pgauth ls [env]` lists every database you can reach and your level, from the server's
+   `/v1/access`.
 
-`listeners` opens one local port per instance. On a listener that names an instance, a bare database
-name becomes `<instance>/<db>` before it reaches pgauth; a name that already has a `/` passes through.
-All listeners share one login and one refresh token. The top-level `listen` (or `--listen`, with an
-optional `--instance`) is a listener without an instance, as before.
+`pgauth env list`, `env login <name>` (log in again) and `env remove <name>` (also deletes the
+keychain entry) manage environments. `connect.yaml` is `--config`, else `$PGAUTH_CONFIG`, else
+`<user config dir>/pgauth/connect.yaml`; see [`connect.example.yaml`](connect.example.yaml) and
+[`examples/rapidata-test/connect.yaml`](examples/rapidata-test/connect.yaml).
 
-```yaml
-listeners:
-  - {listen: 127.0.0.1:15432, instance: main}
-  - {listen: 127.0.0.1:15433, instance: bidder}
-```
+**Tokens** come from a browser login (authorization code + PKCE; redirect
+`http://127.0.0.1:8250/callback`, `callbackPort: 0` for any free port; refresh token in the OS keychain,
+one per environment) or from a file that something else keeps fresh (`token: {file, field,
+statusFile}`, re-read on every connection). The connector never runs a command
+([ADR 0009](docs/adr/0009-tokens-from-login-or-file.md)). A missing, unreadable or expired token file
+fails only that connection, with `FATAL 28000` carrying the status file's text (or the path); the next
+connection reads the file again. A database without a binding fails with
+`no access to prod/payment: no binding grants it`.
 
-```
-psql "host=127.0.0.1 port=15432 dbname=orders"   # pgauth sees main/orders
-```
+Any process of yours that can reach the local port connects with your rights, the same trade-off as
+other local database proxies.
+
+The v0.4 format (top-level `server`/`issuer`, `listeners` per instance) still loads in v0.5 with a
+deprecation warning and stops loading in v0.6.
 
 ### IDEs (DataGrip/Rider)
 
-Create one data source per instance, each pointing at that instance's listener port (`127.0.0.1:15432`
-for `main` above), with any user, no password and SSL off: the connector adds the token and pgauth's
-TLS. The IDE lists every database it finds in `pg_database` and opens one connection per database
-name, which the listener turns into `<instance>/<db>`. Databases pgauth does not serve fail with
-`not served`; to keep the IDE quiet, limit the data source's **Schemas** tab to the databases you use.
+IDEs browse every database in `pg_database` and connect by bare name, which the main port refuses. Give
+each environment its own port instead: `pgauth env add prod <host> --ide-port 15432` (or by hand,
+`listeners: [{listen: 127.0.0.1:15432, env: prod}]`). On that port `order` and `<instance>/order`
+resolve inside prod, and a name of another environment (`test/order`) is refused.
+
+Create one data source per environment on its port, with any user, no password and SSL off. Databases
+pgauth does not serve fail with `serves no database`; limit the data source's **Schemas** tab to the
+databases you use to keep the IDE quiet.
 
 Binaries for macOS (arm64, amd64) and Linux (amd64, arm64) are attached to each
 [GitHub release](https://github.com/RapidataAI/pgauth/releases). A binary downloaded with a browser
