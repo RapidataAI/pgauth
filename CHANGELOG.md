@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.1
+
+- A rules file with no `PgRole` or `PgRoleBinding` (empty or only comments) is invalid, in `pgauth lint` and at runtime: a file read empty mid-write no longer replaces the live set with zero bindings. Delete a file instead of emptying it.
+- Reloads wait for two identical reads 100 ms apart before loading a change, so a file edited in place is not loaded half-written.
+
 ## v0.4.0
 
 - `pgauth connect` takes `listeners`, one local port per instance: a bare database name on an instance listener becomes `<instance>/<db>`, so IDEs such as DataGrip and Rider can browse an instance as one data source. All listeners share one login. The top-level `listen` keeps working unchanged; `--instance` gives `--listen` an instance. Each connection logs its database, e.g. `order → cloudsql-main/order`. `pgauth serve` is unchanged.
