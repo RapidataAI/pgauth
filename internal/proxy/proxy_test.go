@@ -172,7 +172,7 @@ spec:
 
 // startServer runs a pgauth with adminBinding against the shared Postgres; the returned store
 // swaps the access rules.
-func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store) {
+func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store, *auditLog) {
 	t.Helper()
 	cfg := &config.Config{
 		TLS: config.TLS{CertFile: shared.certFile, KeyFile: shared.keyFile},
@@ -194,7 +194,8 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	audit := &auditLog{}
+	log := slog.New(slog.NewJSONHandler(audit, nil))
 	verifier := token.NewVerifier(cfg.OIDC)
 	go verifier.Start(ctx, log)
 	cert, err := tls.LoadX509KeyPair(shared.certFile, shared.keyFile)
@@ -227,7 +228,45 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		cancel()
 		<-done
 	})
-	return ln.Addr().String(), store
+	return ln.Addr().String(), store, audit
+}
+
+// auditLog keeps the server's JSON log lines so tests can read the connect record.
+type auditLog struct {
+	mu    sync.Mutex
+	lines []map[string]any
+}
+
+func (l *auditLog) Write(p []byte) (int, error) {
+	var line map[string]any
+	if json.Unmarshal(p, &line) == nil && line["msg"] == "connect" {
+		l.mu.Lock()
+		l.lines = append(l.lines, line)
+		l.mu.Unlock()
+	}
+	return len(p), nil
+}
+
+func (l *auditLog) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.lines)
+}
+
+// after waits for the first connect record past index n; it is written just after the client is greeted.
+func (l *auditLog) after(t *testing.T, n int) map[string]any {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		l.mu.Lock()
+		if len(l.lines) > n {
+			line := l.lines[n]
+			l.mu.Unlock()
+			return line
+		}
+		l.mu.Unlock()
+	}
+	t.Fatal("no connect log record")
+	return nil
 }
 
 type claims struct {
@@ -268,7 +307,7 @@ spec:
 `
 
 func TestConnect(t *testing.T) {
-	addr, store := startServer(t, nil)
+	addr, store, audit := startServer(t, nil)
 	var (
 		mariOrderRead  = binding("mari-order", "cloudsql-main.order.read", user(defaultUser))
 		mariOrderWrite = binding("mari-order", "cloudsql-main.order.write", user(defaultUser))
@@ -285,32 +324,33 @@ func TestConnect(t *testing.T) {
 		stmt        string
 		wantConnect bool
 		wantStmt    bool
+		wantAudit   string // "granted/level/scope_cap" from the connect record, when set
 	}{
-		{"user binding reads", claims{}, mariOrderRead, "cloudsql-main/order", "SELECT count(*) FROM items", true, true},
-		{"read binding cannot insert", claims{scope: "postgres:write"}, mariOrderRead, "cloudsql-main/order", "INSERT INTO items VALUES (2)", true, false},
-		{"read binding cannot switch to the write group", claims{}, mariOrderRead, "cloudsql-main/order", "SET ROLE order_write", true, false},
-		{"binding on one database does not open another", claims{}, mariOrderRead, "cloudsql-main/assignment", "", false, false},
-		{"user names match case-insensitively", claims{user: "MARI@Example.com"}, mariOrderRead, "cloudsql-main/order", "SELECT 1", true, true},
-		{"groups claim as a single string", claims{user: "ada@example.com", group: "postgres-admins", scope: "postgres:write"}, admins, "cloudsql-main/order", "UPDATE items SET id = id", true, true},
-		{"single-string group must match whole", claims{user: "ada@example.com", group: "postgres-admins interns"}, admins, "cloudsql-main/order", "", false, false},
-		{"write binding with write scope updates", claims{scope: "postgres:write"}, mariOrderWrite, "cloudsql-main/order", "UPDATE items SET id = id", true, true},
-		{"write binding still reads", claims{scope: "postgres:write"}, mariOrderWrite, "cloudsql-main/order", "SELECT count(*) FROM items", true, true},
-		{"group pg-admin inserts with write scope", claims{user: "ada@example.com", groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/assignment", "INSERT INTO items VALUES (3)", true, true},
-		{"read scope caps pg-admin at read", claims{user: "ada@example.com", groups: admin, scope: "openid postgres:read"}, admins, "cloudsql-main/order", "INSERT INTO items VALUES (4)", true, false},
-		{"no postgres scope is refused", claims{user: "ada@example.com", groups: admin, scope: "openid"}, admins, "cloudsql-main/order", "", false, false},
-		{"pg-admin cannot create tables", claims{groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/order", "CREATE TABLE t (id int)", true, false},
-		{"pg-admin cannot drop tables", claims{groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/order", "DROP TABLE items", true, false},
-		{"pg-reader with write scope stays read", claims{groups: admin, scope: "postgres:write"}, readers, "cloudsql-main/order", "DELETE FROM items", true, false},
-		{"union of bindings takes the highest level", claims{groups: admin, scope: "postgres:write"}, readers + mariOrderWrite, "cloudsql-main/order", "UPDATE items SET id = id", true, true},
-		{"custom role with database * reads every database", claims{user: "bo@example.com", groups: []string{"analysts"}}, analysts, "cloudsql-main/assignment", "SELECT count(*) FROM items", true, true},
-		{"other group matches nothing", claims{user: "bo@example.com", groups: []string{"interns"}}, admins + analysts, "cloudsql-main/order", "", false, false},
-		{"pgauth-cli client is allowed", claims{client: "pgauth-cli"}, mariOrderRead, "cloudsql-main/order", "SELECT 1", true, true},
-		{"client outside the allowlist", claims{client: "other-app"}, mariOrderRead, "cloudsql-main/order", "", false, false},
-		{"expired token", claims{expired: true}, mariOrderRead, "cloudsql-main/order", "", false, false},
-		{"token for another audience", claims{audience: "https://api.example.test"}, mariOrderRead, "cloudsql-main/order", "", false, false},
-		{"unknown instance", claims{groups: admin}, admins, "other/order", "", false, false},
-		{"database not served", claims{groups: admin}, admins, "cloudsql-main/postgres", "", false, false},
-		{"database without instance", claims{groups: admin}, admins, "order", "", false, false},
+		{"user binding reads", claims{}, mariOrderRead, "cloudsql-main/order", "SELECT count(*) FROM items", true, true, ""},
+		{"read binding cannot insert", claims{scope: "postgres:write"}, mariOrderRead, "cloudsql-main/order", "INSERT INTO items VALUES (2)", true, false, ""},
+		{"read binding cannot switch to the write group", claims{}, mariOrderRead, "cloudsql-main/order", "SET ROLE order_write", true, false, ""},
+		{"binding on one database does not open another", claims{}, mariOrderRead, "cloudsql-main/assignment", "", false, false, ""},
+		{"user names match case-insensitively", claims{user: "MARI@Example.com"}, mariOrderRead, "cloudsql-main/order", "SELECT 1", true, true, ""},
+		{"groups claim as a single string", claims{user: "ada@example.com", group: "postgres-admins", scope: "postgres:write"}, admins, "cloudsql-main/order", "UPDATE items SET id = id", true, true, ""},
+		{"single-string group must match whole", claims{user: "ada@example.com", group: "postgres-admins interns"}, admins, "cloudsql-main/order", "", false, false, ""},
+		{"write binding with write scope updates", claims{scope: "postgres:write"}, mariOrderWrite, "cloudsql-main/order", "UPDATE items SET id = id", true, true, ""},
+		{"write binding still reads", claims{scope: "postgres:write"}, mariOrderWrite, "cloudsql-main/order", "SELECT count(*) FROM items", true, true, ""},
+		{"group pg-admin inserts with write scope", claims{user: "ada@example.com", groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/assignment", "INSERT INTO items VALUES (3)", true, true, "write/write/write"},
+		{"read scope caps pg-admin at read", claims{user: "ada@example.com", groups: admin, scope: "openid postgres:read"}, admins, "cloudsql-main/order", "INSERT INTO items VALUES (4)", true, false, "write/read/read"},
+		{"no postgres scope is refused", claims{user: "ada@example.com", groups: admin, scope: "openid"}, admins, "cloudsql-main/order", "", false, false, "write/none/none"},
+		{"pg-admin cannot create tables", claims{groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/order", "CREATE TABLE t (id int)", true, false, ""},
+		{"pg-admin cannot drop tables", claims{groups: admin, scope: "postgres:write"}, admins, "cloudsql-main/order", "DROP TABLE items", true, false, ""},
+		{"pg-reader with write scope stays read", claims{groups: admin, scope: "postgres:write"}, readers, "cloudsql-main/order", "DELETE FROM items", true, false, ""},
+		{"union of bindings takes the highest level", claims{groups: admin, scope: "postgres:write"}, readers + mariOrderWrite, "cloudsql-main/order", "UPDATE items SET id = id", true, true, ""},
+		{"custom role with database * reads every database", claims{user: "bo@example.com", groups: []string{"analysts"}}, analysts, "cloudsql-main/assignment", "SELECT count(*) FROM items", true, true, ""},
+		{"other group matches nothing", claims{user: "bo@example.com", groups: []string{"interns"}}, admins + analysts, "cloudsql-main/order", "", false, false, ""},
+		{"pgauth-cli client is allowed", claims{client: "pgauth-cli"}, mariOrderRead, "cloudsql-main/order", "SELECT 1", true, true, ""},
+		{"client outside the allowlist", claims{client: "other-app"}, mariOrderRead, "cloudsql-main/order", "", false, false, ""},
+		{"expired token", claims{expired: true}, mariOrderRead, "cloudsql-main/order", "", false, false, ""},
+		{"token for another audience", claims{audience: "https://api.example.test"}, mariOrderRead, "cloudsql-main/order", "", false, false, ""},
+		{"unknown instance", claims{groups: admin}, admins, "other/order", "", false, false, ""},
+		{"database not served", claims{groups: admin}, admins, "cloudsql-main/postgres", "", false, false, ""},
+		{"database without instance", claims{groups: admin}, admins, "order", "", false, false, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -318,9 +358,16 @@ func TestConnect(t *testing.T) {
 			if err := store.Update([]rbac.File{{Name: "row.yaml", Data: []byte(tt.bindings)}}); err != nil {
 				t.Fatalf("bindings: %v", err)
 			}
+			logged := audit.count()
 			conn, err := connect(ctx, addr, tt.db, tt.claims)
 			if (err == nil) != tt.wantConnect {
 				t.Fatalf("connect error = %v, want connect %v", err, tt.wantConnect)
+			}
+			if tt.wantAudit != "" {
+				r := audit.after(t, logged)
+				if got := fmt.Sprintf("%v/%v/%v", r["granted"], r["level"], r["scope_cap"]); got != tt.wantAudit {
+					t.Errorf("granted/level/scope_cap = %s, want %s", got, tt.wantAudit)
+				}
 			}
 			if err != nil {
 				return
@@ -362,7 +409,7 @@ func TestReleaseDropsRole(t *testing.T) {
 	c := claims{}
 
 	t.Run("last close drops the role", func(t *testing.T) {
-		addr, _ := startServer(t, nil)
+		addr, _, _ := startServer(t, nil)
 		a, err := connect(ctx, addr, "cloudsql-main/order", c)
 		if err != nil {
 			t.Fatal(err)
@@ -385,7 +432,7 @@ func TestReleaseDropsRole(t *testing.T) {
 	})
 
 	t.Run("max connection age closes and drops", func(t *testing.T) {
-		addr, _ := startServer(t, func(cfg *config.Config) { cfg.MaxConnectionAge = config.Duration(300 * time.Millisecond) })
+		addr, _, _ := startServer(t, func(cfg *config.Config) { cfg.MaxConnectionAge = config.Duration(300 * time.Millisecond) })
 		conn, err := connect(ctx, addr, "cloudsql-main/order", c)
 		if err != nil {
 			t.Fatal(err)
@@ -445,7 +492,7 @@ func (m memStore) Set(k, v string) error        { m[k] = v; return nil }
 
 func TestConnector(t *testing.T) {
 	ctx := context.Background()
-	server, _ := startServer(t, nil)
+	server, _, _ := startServer(t, nil)
 	store := memStore{}
 	startConnector := func() string {
 		c, err := pgconnect.New(pgconnect.Options{

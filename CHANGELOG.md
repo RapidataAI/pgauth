@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.2
+
+- The connect log line and span carry `granted` (the level from the bindings, before the scope cap) next to `level` (effective), so the audit shows when a scope reduced write to read.
+
 ## v0.3.1
 
 - `User` subjects match the username claim ignoring case (`oidc.usernameCaseInsensitive`, default true), since issuers keep an email's stored casing. `pgauth lint` warns about uppercase `User` names only when the option is false.
