@@ -159,8 +159,14 @@ func TestUserMatching(t *testing.T) {
 
 func TestLastValidWins(t *testing.T) {
 	dir := t.TempDir()
+	// Replace the file atomically, as a ConfigMap update does: an in-place write can be read while
+	// empty, and an empty set is valid, so the watcher would load "no bindings" in between.
 	write := func(content string) {
-		if err := os.WriteFile(filepath.Join(dir, "bindings.yaml"), []byte(content), 0o600); err != nil {
+		tmp := filepath.Join(dir, ".bindings.tmp")
+		if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, filepath.Join(dir, "bindings.yaml")); err != nil {
 			t.Fatal(err)
 		}
 	}
