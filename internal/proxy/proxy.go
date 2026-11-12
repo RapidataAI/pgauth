@@ -218,7 +218,7 @@ func (s *Server) handle(raw net.Conn) {
 type attempt struct {
 	sub, user, clientID, instance, db, role string
 	groups, bindings                        []string
-	level, scopeCap                         string
+	granted, level, scopeCap                string
 }
 
 func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgproto3.StartupMessage) {
@@ -235,6 +235,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 			attribute.String("pgauth.instance", a.instance),
 			attribute.String("db.namespace", a.db),
 			attribute.StringSlice("pgauth.bindings", a.bindings),
+			attribute.String("pgauth.granted", a.granted),
 			attribute.String("pgauth.level", a.level),
 			attribute.String("pgauth.scope_cap", a.scopeCap),
 			attribute.String("pgauth.decision", decision),
@@ -246,7 +247,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 		}
 		span.End()
 		s.log.Info("connect", "sub", a.sub, "user", a.user, "groups", a.groups, "client_id", a.clientID,
-			"instance", a.instance, "db", a.db, "bindings", a.bindings, "level", a.level, "scope_cap", a.scopeCap,
+			"instance", a.instance, "db", a.db, "bindings", a.bindings, "granted", a.granted, "level", a.level, "scope_cap", a.scopeCap,
 			"decision", decision, "reason", reason, "role", a.role, "duration_ms", d.Milliseconds())
 	}
 
@@ -289,7 +290,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 	a.sub, a.user, a.groups, a.clientID = claims.Subject, claims.Username, claims.Groups, claims.ClientID
 
 	in, d, reason := s.authorize(claims, a.instance, a.db)
-	a.bindings, a.level, a.scopeCap = d.bindings, d.level.String(), d.scopeCap.String()
+	a.bindings, a.granted, a.level, a.scopeCap = d.bindings, d.granted.String(), d.level.String(), d.scopeCap.String()
 	if reason != "" {
 		finish("deny", reason)
 		fail(backend, "28000", "pgauth: "+reason)
@@ -336,6 +337,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 
 type decision struct {
 	bindings   []string
+	granted    rbac.Level // from the bindings, before the scope cap
 	level      rbac.Level // after the scope cap
 	scopeCap   rbac.Level
 	groupRoles []string
@@ -359,18 +361,17 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 	if policy == nil {
 		return nil, d, "access rules are not loaded"
 	}
-	var granted rbac.Level
 	who := rbac.Who{User: claims.Username, Groups: claims.Groups, FoldUser: s.cfg.OIDC.FoldUsername()}
-	granted, d.bindings = policy.Access(who, instName, db)
+	d.granted, d.bindings = policy.Access(who, instName, db)
 	switch {
 	case slices.Contains(claims.Scopes, s.cfg.OIDC.Scopes.Write):
 		d.scopeCap = rbac.Write
 	case slices.Contains(claims.Scopes, s.cfg.OIDC.Scopes.Read):
 		d.scopeCap = rbac.Read
 	}
-	d.level = min(granted, d.scopeCap)
+	d.level = min(d.granted, d.scopeCap)
 	switch {
-	case granted == rbac.None:
+	case d.granted == rbac.None:
 		return nil, d, fmt.Sprintf("no role binding grants %s access to %s/%s", claims.Username, instName, db)
 	case d.scopeCap == rbac.None:
 		return nil, d, fmt.Sprintf("token has neither the %s nor the %s scope", s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)

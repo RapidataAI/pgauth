@@ -92,7 +92,8 @@ spec:
 Files first, CRDs later with the same format, and lint plus last-valid-wins instead of an admission
 webhook: [ADR 0008](docs/adr/0008-role-bindings-files-first.md).
 
-Every connection attempt records the matched bindings, the level after the cap and the cap itself
+Every connection attempt records the matched bindings, the level they grant, the level after the cap
+and the cap itself
 (see [Running](#running)).
 
 ## Preparing an instance
@@ -151,8 +152,8 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
   issuer's keys and a valid set of access rules are loaded and every instance accepts the issuer login
   (and its startup sweep ran); its body reports a rejected rules change.
 - **Audit:** every connection attempt writes one JSON log line and one OpenTelemetry span
-  `pgauth.connect` with `sub`, `user`, `groups`, `client_id`, `instance`, `db`, `bindings`, `level`,
-  `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded. Spans and
+  `pgauth.connect` with `sub`, `user`, `groups`, `client_id`, `instance`, `db`, `bindings`, `granted`
+  (level from the bindings), `level` (after the cap), `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded. Spans and
   metrics are exported when the standard `OTEL_EXPORTER_OTLP_*` variables are set.
 
 ### Multiple replicas
