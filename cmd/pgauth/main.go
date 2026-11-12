@@ -37,7 +37,7 @@ Usage:
   pgauth lint [--config <file>] <dir>   check the PgRole / PgRoleBinding YAML in <dir>
   pgauth connect [--config <file>]      serve localhost for Postgres clients: dbname=<env>/<db>
   pgauth ls [env]                       list the databases you can reach and your level
-  pgauth env add <name> <host> [--ca f] [--write] [--no-login] [--force]
+  pgauth env add <name> <host> [--ca f] [--write] [--ide-port p] [--no-login] [--force]
   pgauth env list | remove <name> | login <name>
   pgauth service install | uninstall    run pgauth connect at login (launchd / systemd --user)
   pgauth version                 print the version

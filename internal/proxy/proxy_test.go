@@ -732,14 +732,18 @@ func TestConnectorEnvironments(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := pgconnect.NewRouter(envs, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
 	cctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	wg.Go(func() { _ = router.Serve(cctx, ln) })
 	t.Cleanup(func() { cancel(); wg.Wait() })
+	addrs := map[string]string{} // listener env ("" = main) -> address
+	for _, env := range []string{"", "test"} {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addrs[env] = ln.Addr().String()
+		wg.Go(func() { _ = router.Serve(cctx, ln, env) })
+	}
 
 	writeToken := func(c *claims) {
 		if c == nil {
@@ -754,25 +758,28 @@ func TestConnectorEnvironments(t *testing.T) {
 	if err := os.WriteFile(statusFile, []byte("Rapidata test is not connected: open Settings → Connections\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	host, port, _ := net.SplitHostPort(ln.Addr().String())
 	tests := []struct {
 		name    string
 		token   *claims // nil: no token file
+		port    string  // listener: "" main, "test" the IDE port bound to test
 		db      string
 		wantErr string // substring of the client's error; empty: SELECT works
 	}{
-		{"missing token file shows the status file", nil, "test/order", "Rapidata test is not connected: open Settings → Connections (SQLSTATE 28000)"},
-		{"token written later is picked up", &claims{}, "test/order", ""},
-		{"instance-qualified address", &claims{}, "test/cloudsql-main/assignment", ""},
-		{"bare database names the environments", &claims{}, "order", "use <env>/<db>; environments: test"},
-		{"unknown database", &claims{}, "test/billing", "test serves no database billing"},
-		{"no binding is reworded", &claims{user: "nobody@example.com"}, "test/order", "no access to test/order: no binding grants it (SQLSTATE 28000)"},
-		{"expired token shows the status file", &claims{expired: true}, "test/order", "Rapidata test is not connected"},
-		{"fixed again", &claims{}, "test/order", ""},
+		{"missing token file shows the status file", nil, "", "test/order", "Rapidata test is not connected: open Settings → Connections (SQLSTATE 28000)"},
+		{"token written later is picked up", &claims{}, "", "test/order", ""},
+		{"instance-qualified address", &claims{}, "", "test/cloudsql-main/assignment", ""},
+		{"bare database names the environments", &claims{}, "", "order", "use <env>/<db>; environments: test"},
+		{"unknown database", &claims{}, "", "test/billing", "test serves no database billing"},
+		{"no binding is reworded", &claims{user: "nobody@example.com"}, "", "test/order", "no access to test/order: no binding grants it (SQLSTATE 28000)"},
+		{"expired token shows the status file", &claims{expired: true}, "", "test/order", "Rapidata test is not connected"},
+		{"fixed again", &claims{}, "", "test/order", ""},
+		{"bare name on the test IDE port", &claims{}, "test", "order", ""},
+		{"instance name on the test IDE port", &claims{}, "test", "cloudsql-main/assignment", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			writeToken(tt.token)
+			host, port, _ := net.SplitHostPort(addrs[tt.port])
 			conn, err := pgx.Connect(ctx, fmt.Sprintf("host=%s port=%s dbname=%s user=me sslmode=disable", host, port, tt.db))
 			if err == nil {
 				defer conn.Close(ctx)

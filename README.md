@@ -193,7 +193,7 @@ test`, and a name on several instances fails and lists the full addresses.
 1. `pgauth env add prod pgauth.example.com` reads the server's discovery
    (`https://<host>:8443/.well-known/pgauth`), pins its issuer and CLI client in `connect.yaml`, logs
    you in through the browser and lists what you can reach. `--write` asks for the write scope,
-   `--ca file` trusts a private CA, `--no-login` skips the login. Adding an environment again with a
+   `--ca file` trusts a private CA, `--ide-port` adds an IDE port (below), `--no-login` skips the login. Adding an environment again with a
    different issuer is refused without `--force`.
 2. `pgauth connect`, or `pgauth service install` to run it at login (launchd on macOS, a systemd user
    unit on Linux; `service uninstall` removes it).
@@ -222,10 +222,14 @@ deprecation warning and stops loading in v0.6.
 
 ### IDEs (DataGrip/Rider)
 
-Create a data source on `127.0.0.1:5432` with any user, no password and SSL off, and set its database
-to an address such as `prod/order`. IDEs that browse every database in `pg_database` ask for bare names,
-which v0.5 refuses; until there is a per-environment IDE port, give each database its own data source
-or keep a v0.4 `listeners` config for browsing.
+IDEs browse every database in `pg_database` and connect by bare name, which the main port refuses. Give
+each environment its own port instead: `pgauth env add prod <host> --ide-port 15432` (or by hand,
+`listeners: [{listen: 127.0.0.1:15432, env: prod}]`). On that port `order` and `<instance>/order`
+resolve inside prod, and a name of another environment (`test/order`) is refused.
+
+Create one data source per environment on its port, with any user, no password and SSL off. Databases
+pgauth does not serve fail with `serves no database`; limit the data source's **Schemas** tab to the
+databases you use to keep the IDE quiet.
 
 Binaries for macOS (arm64, amd64) and Linux (amd64, arm64) are attached to each
 [GitHub release](https://github.com/RapidataAI/pgauth/releases). A binary downloaded with a browser

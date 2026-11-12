@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -133,6 +134,17 @@ func (f *File) Validate() error {
 			errs = append(errs, fmt.Errorf("environment %s: token needs login: browser or a file", name))
 		}
 	}
+	for _, l := range f.Listeners {
+		switch {
+		case l.Instance != "":
+			errs = append(errs, fmt.Errorf("listener %s: instance listeners are the v0.4 format; name an env instead", l.Listen))
+		case f.Environments[l.Env] == nil:
+			errs = append(errs, fmt.Errorf("listener %s: no environment %q", l.Listen, l.Env))
+		}
+		if _, _, err := net.SplitHostPort(l.Listen); err != nil {
+			errs = append(errs, fmt.Errorf("listener %q must be host:port", l.Listen))
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -155,6 +167,8 @@ type AddOptions struct {
 	CA    string
 	Write bool
 	Force bool
+	// IDEPort, when set, adds a listener on 127.0.0.1:<port> bound to this environment.
+	IDEPort int
 }
 
 // AddEnv writes environment name from serve's discovery, pinning the issuer and client: an
@@ -174,6 +188,15 @@ func AddEnv(f *File, name, apiURL string, d *api.Discovery, o AddOptions) error 
 			return fmt.Errorf("environment %s is pinned to issuer %s but the server now names %s; use --force if that is expected", name, old.Token.Issuer, d.Issuer)
 		}
 	}
+	ideListen := ""
+	if o.IDEPort != 0 {
+		ideListen = net.JoinHostPort("127.0.0.1", fmt.Sprint(o.IDEPort))
+		for _, l := range f.Listeners {
+			if l.Listen == ideListen && l.Env != name {
+				return fmt.Errorf("port %d already serves environment %s", o.IDEPort, l.Env)
+			}
+		}
+	}
 	scope := d.Scopes.Read
 	if o.Write {
 		scope = d.Scopes.Write
@@ -190,7 +213,16 @@ func AddEnv(f *File, name, apiURL string, d *api.Discovery, o AddOptions) error 
 			Scope: strings.TrimSpace("openid offline_access " + scope),
 		},
 	}
+	if ideListen != "" {
+		f.RemoveListeners(name)
+		f.Listeners = append(f.Listeners, Listener{Listen: ideListen, Env: name})
+	}
 	return nil
+}
+
+// RemoveListeners drops the listeners bound to environment name.
+func (f *File) RemoveListeners(name string) {
+	f.Listeners = slices.DeleteFunc(f.Listeners, func(l Listener) bool { return l.Env == name })
 }
 
 // BuildOptions carry what the environments' browser logins need.

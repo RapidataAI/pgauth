@@ -3,6 +3,8 @@
 listen: 127.0.0.1:5432          # clients use dbname=<env>/<db> or <env>/<instance>/<db>
 # serverCA: /path/to/ca.pem     # when pgauth's certificate is not from a public CA; also per environment
 callbackPort: 8250              # browser login redirect http://127.0.0.1:8250/callback; 0 = any free port
+listeners:                      # opt-in IDE ports: bare names resolve inside that environment
+  - {listen: 127.0.0.1:15432, env: prod}
 environments:
   prod:
     server: pgauth.example.com:5432

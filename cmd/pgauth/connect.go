@@ -102,16 +102,39 @@ func connectCmd(args []string) error {
 	if addr == "" {
 		addr = "127.0.0.1:5432"
 	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
+	listeners := append([]connect.Listener{{Listen: addr}}, f.Listeners...)
+	lns := make([]net.Listener, 0, len(listeners))
+	defer func() {
+		for _, ln := range lns {
+			ln.Close()
+		}
+	}()
+	router := connect.NewRouter(envs, log)
+	for _, l := range listeners {
+		ln, err := net.Listen("tcp", l.Listen)
+		if err != nil {
+			return err
+		}
+		lns = append(lns, ln)
+		host, p, _ := net.SplitHostPort(ln.Addr().String())
+		if l.Env == "" {
+			log.Info("ready", "environments", strings.Join(router.Names(), ","), "connect", fmt.Sprintf(`psql "host=%s port=%s dbname=<env>/<db>"`, host, p))
+		} else {
+			log.Info("ready", "env", l.Env, "connect", fmt.Sprintf(`psql "host=%s port=%s dbname=<db>"`, host, p))
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	router := connect.NewRouter(envs, log)
-	host, p, _ := net.SplitHostPort(ln.Addr().String())
-	log.Info("ready", "environments", strings.Join(router.Names(), ","), "connect", fmt.Sprintf(`psql "host=%s port=%s dbname=<env>/<db>"`, host, p))
-	return router.Serve(ctx, ln)
+	errs := make(chan error, len(lns))
+	for i, ln := range lns {
+		go func() { errs <- router.Serve(ctx, ln, listeners[i].Env) }()
+	}
+	err = <-errs
+	stop()
+	for range len(lns) - 1 {
+		<-errs
+	}
+	return err
 }
 
 func connectLegacy(f *connect.File, callbackPort int, listen, instance string, log *slog.Logger) error {
@@ -227,6 +250,7 @@ func envCmd(args []string) error {
 	write := fs.Bool("write", false, "env add: ask for the write scope instead of read")
 	noLogin := fs.Bool("no-login", false, "env add: do not log in now")
 	force := fs.Bool("force", false, "env add: replace an environment whose issuer or token source changed")
+	idePort := fs.Int("ide-port", 0, "env add: also listen on 127.0.0.1:<port> for this environment, where bare names work (for IDEs)")
 	pos := parseInterspersed(fs, args[1:])
 	cfgPath := configPath(*path)
 	f, err := connect.LoadFile(cfgPath)
@@ -237,7 +261,7 @@ func envCmd(args []string) error {
 	switch args[0] {
 	case "add":
 		if len(pos) != 2 {
-			return fmt.Errorf("usage: pgauth env add <name> <host[:port]> [--ca file] [--write] [--no-login] [--force]")
+			return fmt.Errorf("usage: pgauth env add <name> <host[:port]> [--ca file] [--write] [--ide-port port] [--no-login] [--force]")
 		}
 		name, host := pos[0], pos[1]
 		if _, _, err := net.SplitHostPort(host); err != nil {
@@ -252,7 +276,7 @@ func envCmd(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := connect.AddEnv(f, name, apiURL, d, connect.AddOptions{CA: *ca, Write: *write, Force: *force}); err != nil {
+		if err := connect.AddEnv(f, name, apiURL, d, connect.AddOptions{CA: *ca, Write: *write, Force: *force, IDEPort: *idePort}); err != nil {
 			return err
 		}
 		if err := f.Save(cfgPath); err != nil {
@@ -286,6 +310,7 @@ func envCmd(args []string) error {
 			}
 		}
 		delete(f.Environments, pos[0])
+		f.RemoveListeners(pos[0])
 		return f.Save(cfgPath)
 	case "login":
 		if len(pos) != 1 {

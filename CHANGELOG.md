@@ -4,6 +4,7 @@
 
 - `pgauth connect` reaches several pgauth deployments as `environments` in `connect.yaml`; the database name is the address (`<env>/<db>` or `<env>/<instance>/<db>`, no default environment). Tokens come from a browser login (keychain per environment) or a `file` re-read on every connection; token problems fail only that connection with `FATAL 28000` and the status file's text, never the connector. Missing grants read `no access to <env>/<db>: no binding grants it`. `--config` / `$PGAUTH_CONFIG` pick the config.
 - New commands: `pgauth ls [env]`, `pgauth env add|list|remove|login`, `pgauth service install|uninstall`.
+- Opt-in IDE ports: `listeners: [{listen, env}]` (`env add --ide-port`) resolve bare names inside one environment, for IDEs that browse `pg_database`; the main port keeps refusing bare names.
 - **Deprecated:** the v0.4 connect.yaml (top-level `server`/`issuer`/`listeners`) still loads with a warning and is removed in v0.6.
 - `pgauth serve` has an HTTPS listener (`http.listen`, Postgres certificate) with `GET /.well-known/pgauth` (discovery, new `discovery.cliClientId` / `discovery.postgres`) and `GET /v1/access` (the token's databases and levels).
 

@@ -115,10 +115,32 @@ func (r *Router) Resolve(ctx context.Context, database string) (*Env, string, er
 	if len(parts) < 2 || len(parts) > 3 || !ok {
 		return nil, "", routeError{fmt.Sprintf("use <env>/<db>; environments: %s", strings.Join(r.Names(), ", "))}
 	}
-	if len(parts) == 3 {
-		return e, parts[1] + "/" + parts[2], nil
+	return r.resolveIn(ctx, e, parts[1:], database)
+}
+
+// ResolveOn resolves a name on a listener bound to one environment: "<db>" and "<instance>/<db>"
+// are inside it, and an "<env>/..." name is accepted only for that same environment.
+func (r *Router) ResolveOn(ctx context.Context, env, database string) (*Env, string, error) {
+	e := r.envs[env]
+	parts := strings.Split(database, "/")
+	if other, ok := r.envs[parts[0]]; ok && len(parts) > 1 {
+		if other != e {
+			return nil, "", routeError{fmt.Sprintf("this port serves %s; %s names %s, use its port or the main one", env, database, parts[0])}
+		}
+		parts = parts[1:]
 	}
-	db := parts[1]
+	if len(parts) > 2 || parts[0] == "" {
+		return nil, "", routeError{fmt.Sprintf("this port serves %s; use <db> or <instance>/<db>", env)}
+	}
+	return r.resolveIn(ctx, e, parts, database)
+}
+
+// resolveIn handles the part after the environment: "<instance>/<db>" or "<db>".
+func (r *Router) resolveIn(ctx context.Context, e *Env, parts []string, database string) (*Env, string, error) {
+	if len(parts) == 2 {
+		return e, parts[0] + "/" + parts[1], nil
+	}
+	db := parts[0]
 	d, err := e.Discovery(ctx)
 	if err != nil {
 		return nil, "", routeError{fmt.Sprintf("cannot look up %s: %v", database, err)}
@@ -137,10 +159,14 @@ func (r *Router) Resolve(ctx context.Context, database string) (*Env, string, er
 	}
 }
 
-// Serve accepts local connections on ln until ctx ends.
-func (r *Router) Serve(ctx context.Context, ln net.Listener) error {
+// Serve accepts local connections on ln until ctx ends; with env set, names resolve inside it.
+func (r *Router) Serve(ctx context.Context, ln net.Listener, env string) error {
 	f := &forwarder{log: r.log, route: func(ctx context.Context, database string) (target, error) {
-		e, db, err := r.Resolve(ctx, database)
+		resolve := r.Resolve
+		if env != "" {
+			resolve = func(ctx context.Context, database string) (*Env, string, error) { return r.ResolveOn(ctx, env, database) }
+		}
+		e, db, err := resolve(ctx, database)
 		if err != nil {
 			return target{}, err
 		}

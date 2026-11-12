@@ -151,10 +151,12 @@ func (c *Connector) Token(ctx context.Context) (string, error) {
 	return c.access, nil
 }
 
-// Listener is one local address; with an Instance, bare database names are taken to be on it.
+// Listener is one extra local address. In the environments format it names an Env, and names on
+// it resolve inside that environment (for IDEs); in the v0.4 format it names an Instance.
 type Listener struct {
 	Listen   string `json:"listen"`
-	Instance string `json:"instance"`
+	Env      string `json:"env,omitempty"`
+	Instance string `json:"instance,omitempty"`
 }
 
 // TargetDatabase is the database pgauth is asked for: a bare name gets "<instance>/" when the

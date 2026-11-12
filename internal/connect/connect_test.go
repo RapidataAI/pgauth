@@ -39,28 +39,39 @@ func TestResolve(t *testing.T) {
 	envs := []*Env{{Name: "prod", disc: disc, discAt: time.Now()}, {Name: "test", disc: disc, discAt: time.Now()}}
 	r := NewRouter(envs, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	tests := []struct {
+		port                        string // "" is the main listener, else the env a listener is bound to
 		database, env, forward, err string
 	}{
-		{"prod/order", "prod", "main/order", ""},
-		{"test/bids", "test", "bidder/bids", ""},
-		{"prod/bidder/audit", "prod", "bidder/audit", ""},
-		{"prod/main/missing", "prod", "main/missing", ""},
-		{"prod/audit", "", "", "prod/audit is on several instances; use prod/main/audit or prod/bidder/audit"},
-		{"prod/payment", "", "", "prod serves no database payment; `pgauth ls prod` lists what you can reach"},
-		{"order", "", "", "use <env>/<db>; environments: prod, test"},
-		{"main/order", "", "", "use <env>/<db>; environments: prod, test"},
-		{"prod/a/b/c", "", "", "use <env>/<db>; environments: prod, test"},
+		{"", "prod/order", "prod", "main/order", ""},
+		{"", "test/bids", "test", "bidder/bids", ""},
+		{"", "prod/bidder/audit", "prod", "bidder/audit", ""},
+		{"", "prod/main/missing", "prod", "main/missing", ""},
+		{"", "prod/audit", "", "", "prod/audit is on several instances; use prod/main/audit or prod/bidder/audit"},
+		{"", "prod/payment", "", "", "prod serves no database payment; `pgauth ls prod` lists what you can reach"},
+		{"", "order", "", "", "use <env>/<db>; environments: prod, test"},
+		{"", "main/order", "", "", "use <env>/<db>; environments: prod, test"},
+		{"", "prod/a/b/c", "", "", "use <env>/<db>; environments: prod, test"},
+		{"prod", "order", "prod", "main/order", ""},
+		{"prod", "bidder/audit", "prod", "bidder/audit", ""},
+		{"prod", "prod/order", "prod", "main/order", ""},
+		{"prod", "audit", "", "", "audit is on several instances; use prod/main/audit or prod/bidder/audit"},
+		{"prod", "test/order", "", "", "this port serves prod; test/order names test, use its port or the main one"},
+		{"prod", "a/b/c", "", "", "this port serves prod; use <db> or <instance>/<db>"},
 	}
 	for _, tt := range tests {
-		e, forward, err := r.Resolve(context.Background(), tt.database)
+		resolve := r.Resolve
+		if tt.port != "" {
+			resolve = func(ctx context.Context, db string) (*Env, string, error) { return r.ResolveOn(ctx, tt.port, db) }
+		}
+		e, forward, err := resolve(context.Background(), tt.database)
 		if tt.err != "" {
 			if err == nil || err.Error() != tt.err {
-				t.Errorf("%s: err = %v, want %q", tt.database, err, tt.err)
+				t.Errorf("[%s] %s: err = %v, want %q", tt.port, tt.database, err, tt.err)
 			}
 			continue
 		}
 		if err != nil || e.Name != tt.env || forward != tt.forward {
-			t.Errorf("%s: got %v %q %v, want %s %s", tt.database, e, forward, err, tt.env, tt.forward)
+			t.Errorf("[%s] %s: got %v %q %v, want %s %s", tt.port, tt.database, e, forward, err, tt.env, tt.forward)
 		}
 	}
 	if got := envs[0].Address(disc, "main", "order"); got != "prod/order" {
@@ -155,10 +166,15 @@ func TestAddEnv(t *testing.T) {
 			"https://new.example.com/", AddOptions{Force: true}, "openid offline_access postgres:read", ""},
 		{"file token is not replaced", &EnvConfig{Server: "old:5432", Token: TokenConfig{File: "/run/token.json"}},
 			"https://auth.example.com/", AddOptions{}, "", "reads its token from /run/token.json"},
+		{"--ide-port adds a listener", nil, "https://auth.example.com/", AddOptions{IDEPort: 15432}, "openid offline_access postgres:read", ""},
+		{"--ide-port taken by another env", nil, "https://auth.example.com/", AddOptions{IDEPort: 15433}, "", "port 15433 already serves environment test"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := &File{Environments: map[string]*EnvConfig{}}
+			f := &File{
+				Environments: map[string]*EnvConfig{"test": {Server: "t:5432", Token: TokenConfig{File: "/t"}}},
+				Listeners:    []Listener{{Listen: "127.0.0.1:15433", Env: "test"}},
+			}
 			if tt.existing != nil {
 				f.Environments["prod"] = tt.existing
 			}
@@ -179,6 +195,16 @@ func TestAddEnv(t *testing.T) {
 			}
 			if err := f.Validate(); err != nil {
 				t.Fatalf("written config does not validate: %v", err)
+			}
+			wantListeners := 1
+			if tt.opts.IDEPort != 0 {
+				wantListeners = 2
+				if l := f.Listeners[1]; l.Env != "prod" || l.Listen != "127.0.0.1:15432" {
+					t.Fatalf("listener = %+v", l)
+				}
+			}
+			if len(f.Listeners) != wantListeners {
+				t.Fatalf("listeners = %+v", f.Listeners)
 			}
 		})
 	}
