@@ -18,6 +18,9 @@ type Config struct {
 	Listen string `json:"listen"`
 	// Health serves GET /healthz and /readyz; empty disables it.
 	Health string `json:"health"`
+	// AccessHelp is appended to every "no binding grants it" denial and shown by `pgauth ls` when
+	// nothing is reachable: where to ask for access.
+	AccessHelp string `json:"accessHelp"`
 	// HTTP serves discovery and access over HTTPS with the Postgres certificate; empty disables it.
 	HTTP      HTTP      `json:"http"`
 	Discovery Discovery `json:"discovery"`

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/RapidataAI/pgauth/internal/api"
@@ -306,4 +308,44 @@ func FetchDiscovery(ctx context.Context, client *http.Client, apiURL string) (*a
 		return nil, err
 	}
 	return &d, nil
+}
+
+// PrintAccess writes what each named environment's token reaches to out, and per-environment
+// failures to errOut; an environment with nothing reachable gets the server's access help.
+func (r *Router) PrintAccess(ctx context.Context, out, errOut io.Writer, names []string) error {
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "DATABASE\tLEVEL")
+	failed := false
+	var empty []string
+	for _, name := range names {
+		e := r.envs[name]
+		d, err := e.Discovery(ctx)
+		var access []api.Access
+		if err == nil {
+			access, err = e.Access(ctx)
+		}
+		if err != nil {
+			fmt.Fprintf(errOut, "%s: %v\n", name, err)
+			failed = true
+			continue
+		}
+		for _, a := range access {
+			fmt.Fprintf(w, "%s\t%s\n", e.Address(d, a.Instance, a.Database), a.Level)
+		}
+		if len(access) == 0 {
+			msg := name + ": no database is reachable with this token."
+			if d.AccessHelp != "" {
+				msg += " " + strings.Join(strings.Fields(d.AccessHelp), " ")
+			}
+			empty = append(empty, msg)
+		}
+	}
+	_ = w.Flush()
+	for _, msg := range empty {
+		fmt.Fprintln(out, msg)
+	}
+	if failed {
+		return errors.New("some environments could not be listed")
+	}
+	return nil
 }

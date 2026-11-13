@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -134,7 +133,7 @@ func (f *forwarder) handle(ctx context.Context, conn net.Conn) {
 	switch msg := msg.(type) {
 	case *pgproto3.AuthenticationCleartextPassword:
 	case *pgproto3.ErrorResponse:
-		f.relayError(backend, msg, t)
+		f.relayError(backend, msg)
 		return
 	default:
 		fail(backend, "08P01", fmt.Sprintf("pgauth connect: unexpected %T from pgauth", msg))
@@ -144,8 +143,8 @@ func (f *forwarder) handle(ctx context.Context, conn net.Conn) {
 	if err := frontend.Flush(); err != nil {
 		return
 	}
-	// Relay the startup answers message by message up to ReadyForQuery, so denials can be reworded
-	// and the cancel key is known; after that the server is silent until the client speaks.
+	// Relay the startup answers message by message up to ReadyForQuery, so the cancel key is known;
+	// after that the server is silent until the client speaks.
 	var key uint32
 	defer func() {
 		if key != 0 {
@@ -160,7 +159,7 @@ func (f *forwarder) handle(ctx context.Context, conn net.Conn) {
 		}
 		switch msg := msg.(type) {
 		case *pgproto3.ErrorResponse:
-			f.relayError(backend, msg, t)
+			f.relayError(backend, msg)
 			return
 		case *pgproto3.BackendKeyData:
 			key = msg.ProcessID
@@ -180,11 +179,8 @@ func (f *forwarder) handle(ctx context.Context, conn net.Conn) {
 	}
 }
 
-// relayError passes pgauth's refusal on, naming the database the way the client asked for it.
-func (f *forwarder) relayError(backend *pgproto3.Backend, msg *pgproto3.ErrorResponse, t target) {
-	if msg.Code == "28000" && strings.Contains(msg.Message, "no role binding grants") {
-		msg.Message = fmt.Sprintf("no access to %s: no binding grants it", t.label)
-	}
+// relayError passes pgauth's refusal on unchanged: serve's text says why and where to ask.
+func (f *forwarder) relayError(backend *pgproto3.Backend, msg *pgproto3.ErrorResponse) {
 	backend.Send(msg)
 	_ = backend.Flush()
 }

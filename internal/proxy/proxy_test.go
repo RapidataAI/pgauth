@@ -189,7 +189,8 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 			Issuer: shared.issuer.srv.URL, Audience: audience,
 			AllowedClients: []string{"poseidon-session", "pgauth-cli"},
 		},
-		RBAC: config.RBAC{Dir: "unused-in-tests"},
+		AccessHelp: "Ask in #data-access for a binding.",
+		RBAC:       config.RBAC{Dir: "unused-in-tests"},
 		Instances: []config.Instance{{
 			Name: instanceName, Host: shared.host, Port: shared.port, SSLMode: "disable",
 			Databases: []string{"order", "assignment"}, CredentialsFile: shared.credFile,
@@ -456,7 +457,7 @@ func TestAPI(t *testing.T) {
 		t.Fatalf("discovery: %d", code)
 	}
 	if disc.Postgres != "pgauth.example.test:5432" || disc.Issuer != shared.issuer.srv.URL || disc.Audience != audience ||
-		disc.CLIClientID != "pgauth-cli" || disc.Scopes != (api.Scopes{Read: "postgres:read", Write: "postgres:write"}) ||
+		disc.CLIClientID != "pgauth-cli" || disc.AccessHelp != "Ask in #data-access for a binding." || disc.Scopes != (api.Scopes{Read: "postgres:read", Write: "postgres:write"}) ||
 		len(disc.Instances) != 1 || disc.Instances[0].Name != instanceName || strings.Join(disc.Instances[0].Databases, ",") != "order,assignment" {
 		t.Fatalf("discovery = %+v", disc)
 	}
@@ -498,6 +499,17 @@ func TestAPI(t *testing.T) {
 				t.Fatalf("access = %v, want %s", entries, tt.want)
 			}
 		})
+	}
+}
+
+func TestDenial(t *testing.T) {
+	for _, tt := range []struct{ help, want string }{
+		{"", "no access to main/payment for luca@example.com: no binding grants it."},
+		{"Ask in\n  #data-access\n", "no access to main/payment for luca@example.com: no binding grants it. Ask in #data-access"},
+	} {
+		if got := denial("main", "payment", "luca@example.com", tt.help); got != tt.want {
+			t.Errorf("denial(help %q) = %q, want %q", tt.help, got, tt.want)
+		}
 	}
 }
 
@@ -770,7 +782,10 @@ func TestConnectorEnvironments(t *testing.T) {
 		{"instance-qualified address", &claims{}, "", "test/cloudsql-main/assignment", ""},
 		{"bare database names the environments", &claims{}, "", "order", "use <env>/<db>; environments: test"},
 		{"unknown database", &claims{}, "", "test/billing", "test serves no database billing"},
-		{"no binding is reworded", &claims{user: "nobody@example.com"}, "", "test/order", "no access to test/order: no binding grants it (SQLSTATE 28000)"},
+		{"denial passes through with help", &claims{user: "nobody@example.com"}, "", "test/order",
+			"FATAL: pgauth: no access to cloudsql-main/order for nobody@example.com: no binding grants it. Ask in #data-access for a binding. (SQLSTATE 28000)"},
+		{"denial passes through on the IDE port", &claims{user: "nobody@example.com"}, "test", "assignment",
+			"FATAL: pgauth: no access to cloudsql-main/assignment for nobody@example.com: no binding grants it. Ask in #data-access for a binding. (SQLSTATE 28000)"},
 		{"expired token shows the status file", &claims{expired: true}, "", "test/order", "Rapidata test is not connected"},
 		{"fixed again", &claims{}, "", "test/order", ""},
 		{"bare name on the test IDE port", &claims{}, "test", "order", ""},
@@ -791,10 +806,22 @@ func TestConnectorEnvironments(t *testing.T) {
 		})
 	}
 
-	e, _ := router.Env("test")
-	access, err := e.Access(ctx)
-	if err != nil || len(access) != 2 || access[0].Level != "read" {
-		t.Fatalf("access through the connector's token: %+v, %v", access, err)
+	for _, tt := range []struct {
+		name  string
+		token claims
+		want  string
+	}{
+		{"ls lists reachable databases", claims{}, "test/order       read\ntest/assignment  read\n"},
+		{"ls with nothing reachable shows the help", claims{user: "nobody@example.com"},
+			"DATABASE  LEVEL\ntest: no database is reachable with this token. Ask in #data-access for a binding.\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			writeToken(&tt.token)
+			var out, errOut strings.Builder
+			if err := router.PrintAccess(ctx, &out, &errOut, []string{"test"}); err != nil || !strings.Contains(out.String(), tt.want) {
+				t.Fatalf("ls output:\n%s\nerr %v %s; want it to contain:\n%s", out.String(), err, errOut.String(), tt.want)
+			}
+		})
 	}
 }
 
