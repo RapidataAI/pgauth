@@ -46,6 +46,9 @@ type Server struct {
 	cancels   sync.Map // uint32 client-facing pid -> *cancelTarget
 	conns     sync.WaitGroup
 	stopping  chan struct{}
+
+	userMu    sync.Mutex
+	userConns map[string]int
 }
 
 type instance struct {
@@ -70,6 +73,7 @@ func New(cfg *config.Config, verifier *token.Verifier, store *rbac.Store, tlsCon
 		tracer:    otel.Tracer("github.com/RapidataAI/pgauth"),
 		instances: map[string]*instance{},
 		stopping:  make(chan struct{}),
+		userConns: map[string]int{},
 	}
 	for _, in := range cfg.Instances {
 		s.instances[in.Name] = &instance{cfg: in}
@@ -103,7 +107,13 @@ func (s *Server) startInstance(ctx context.Context, in *instance) error {
 	if err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, in.cfg.ConnString(creds.Username, creds.Password, in.cfg.AdminDatabase))
+	poolCfg, err := pgxpool.ParseConfig(in.cfg.ConnString(creds.Username, creds.Password, in.cfg.AdminDatabase))
+	if err != nil {
+		return err
+	}
+	guard(&poolCfg.ConnConfig.Config, in.cfg)
+	poolCfg.MaxConns = 8
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return err
 	}
@@ -111,13 +121,21 @@ func (s *Server) startInstance(ctx context.Context, in *instance) error {
 		pool.Close()
 		return err
 	}
-	mgr := roles.NewManager(pool, s.cfg.TempGroup, s.cfg.RolePrefix, []byte(creds.Password), s.log)
-	dropped, err := mgr.Sweep(ctx, time.Duration(s.cfg.SweepMinAge))
+	mgr := roles.NewManager(pool, roles.Options{
+		TempGroup: s.cfg.TempGroup, Prefix: s.cfg.RolePrefix, ConnectionLimit: s.cfg.RoleConnectionLimit,
+		MaxConnectionAge: time.Duration(s.cfg.MaxConnectionAge), Log: s.log,
+	})
+	if err := mgr.Start(ctx); err != nil {
+		pool.Close()
+		return fmt.Errorf("owner lock: %w", err)
+	}
+	removed, err := mgr.Sweep(ctx)
 	if err != nil {
 		pool.Close()
 		return fmt.Errorf("sweep: %w", err)
 	}
-	s.log.Info("instance ready", "instance", in.cfg.Name, "swept", dropped)
+	go mgr.Run(ctx, time.Duration(s.cfg.SweepInterval))
+	s.log.Info("instance ready", "instance", in.cfg.Name, "swept", removed, "pod", mgr.Nonce())
 	in.pool, in.roles = pool, mgr
 	in.ready.Store(true)
 	return nil
@@ -175,6 +193,7 @@ func (s *Server) handle(raw net.Conn) {
 	defer func() { conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	backend := pgproto3.NewBackend(conn, conn)
+	backend.SetMaxBodyLen(maxAuthMessage)
 
 	for range 3 {
 		msg, err := backend.ReceiveStartupMessage()
@@ -195,6 +214,7 @@ func (s *Server) handle(raw net.Conn) {
 			}
 			conn = tlsConn
 			backend = pgproto3.NewBackend(conn, conn)
+			backend.SetMaxBodyLen(maxAuthMessage)
 		case *pgproto3.GSSEncRequest:
 			if _, err := conn.Write([]byte{'N'}); err != nil {
 				return
@@ -296,18 +316,23 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 		return
 	}
 
+	if !s.admit(claims.Subject) {
+		reason := fmt.Sprintf("too many connections for %s (limit %d)", claims.Username, s.cfg.MaxConnectionsPerUser)
+		finish("deny", reason)
+		fail(backend, "53300", "pgauth: "+reason)
+		return
+	}
+	defer s.leave(claims.Subject)
+
 	spec := roles.Spec{
-		Subject: claims.Subject, Username: claims.Username, ClientID: claims.ClientID,
-		Roles: []string{a.instance + "/" + a.db + ":" + d.level.String()}, Groups: d.groupRoles,
+		Subject: claims.Subject, Username: claims.Username, ClientID: claims.ClientID, Expiry: claims.Expiry,
+		Roles: append([]string{a.instance + "/" + a.db + ":" + d.level.String()}, d.groupRoles...), Groups: d.groupRoles,
 	}
 	var upstream *pgconn.HijackedConn
-	role, pid, err := in.roles.Acquire(ctx, spec, func(role, password string) (uint32, error) {
+	role, err := in.roles.Acquire(ctx, spec, func(role, password string) error {
 		up, err := s.dial(ctx, in.cfg, role, password, a.db, startup.Parameters)
-		if err != nil {
-			return 0, err
-		}
 		upstream = up
-		return up.PID, nil
+		return err
 	})
 	a.role = role
 	if err != nil {
@@ -318,7 +343,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		in.roles.Release(ctx, role, pid)
+		in.roles.Release(ctx, role)
 	}()
 	defer upstream.Conn.Close()
 
@@ -374,6 +399,9 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 	if d.level == rbac.Write {
 		d.groupRoles = append(d.groupRoles, s.cfg.GroupRole("write", db))
 	}
+	if in.cfg.StatsRole != "" {
+		d.groupRoles = append(d.groupRoles, in.cfg.StatsRole)
+	}
 	return in, d, ""
 }
 
@@ -392,6 +420,7 @@ func (s *Server) dial(ctx context.Context, in config.Instance, role, password, d
 		return nil, err
 	}
 	cfg.MinProtocolVersion, cfg.MaxProtocolVersion = "3.0", "3.0"
+	guard(cfg, in)
 	for k, v := range params {
 		if k == "user" || k == "database" || k == "replication" || strings.HasPrefix(k, "_pq_.") {
 			continue
@@ -409,6 +438,35 @@ func (s *Server) dial(ctx context.Context, in config.Instance, role, password, d
 		return nil, err
 	}
 	return pc.Hijack()
+}
+
+// guard makes connections of cfg refuse every upstream password method but SCRAM when in requires it.
+func guard(cfg *pgconn.Config, in config.Instance) {
+	if !in.ScramOnly() {
+		return
+	}
+	cfg.BuildFrontend = func(r io.Reader, w io.Writer) *pgproto3.Frontend {
+		return pgproto3.NewFrontend(&scramGuard{r: r}, w)
+	}
+}
+
+// admit counts one more connection for subject unless that would pass MaxConnectionsPerUser.
+func (s *Server) admit(subject string) bool {
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	if s.userConns[subject] >= s.cfg.MaxConnectionsPerUser {
+		return false
+	}
+	s.userConns[subject]++
+	return true
+}
+
+func (s *Server) leave(subject string) {
+	s.userMu.Lock()
+	defer s.userMu.Unlock()
+	if s.userConns[subject]--; s.userConns[subject] <= 0 {
+		delete(s.userConns, subject)
+	}
 }
 
 // greet finishes the client's startup as if it had logged in directly, with a cancel key of pgauth's own.

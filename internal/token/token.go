@@ -24,6 +24,7 @@ type Claims struct {
 	// Groups carry the configured prefix.
 	Groups []string
 	Scopes []string
+	Expiry time.Time
 }
 
 type Verifier struct {
@@ -95,7 +96,7 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	if err := tok.Claims(&all); err != nil {
 		return Claims{}, fmt.Errorf("%w: unreadable claims", ErrDenied)
 	}
-	c := Claims{Subject: tok.Subject}
+	c := Claims{Subject: tok.Subject, Expiry: tok.Expiry}
 	if c.Subject == "" {
 		return Claims{}, fmt.Errorf("%w: no sub claim", ErrDenied)
 	}

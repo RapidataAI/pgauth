@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.0
+
+Security release from an audit of v0.5.1–v0.5.2. Upgrading drops the previous version's temporary roles on the first sweep, ending their sessions.
+
+- **Revocation bypass fixed.** A temporary role could set its own password and log in to Postgres directly, then outlive its last pgauth connection (the drop skipped roles with sessions), or make itself undroppable with a large object or default privileges. Removal is now `NOLOGIN` → revoke groups → terminate every session → `DROP ROLE`; a role that cannot be dropped stays without login or rights, logged and counted in `pgauth.roles.drop_failed`. Reusing a role resets its password.
+- **Roles belong to one process** (ADR 0012): names and comments carry a per-process nonce held as an advisory lock; cross-pod reuse and the HMAC-derived role passwords are gone. The sweep runs every `sweepInterval` (1m) and removes roles of dead owners and roles older than 1.5 × `maxConnectionAge` + 10m. `sweepMinAge` is ignored.
+- **Caps.** Temporary roles get `CONNECTION LIMIT roleConnectionLimit` (20) and `VALID UNTIL` token expiry + 5m; `maxConnectionsPerUser` (50) caps one subject's connections (`53300 too many connections`).
+- **Pre-auth memory.** Messages before authentication are capped at 64 KiB (an unauthenticated 300 MiB password message grew RSS by 300 MiB).
+- **`requireScram`** (per instance, default true): pgauth refuses any upstream password method but SCRAM-SHA-256 before sending a password, so a spoofed server cannot collect the issuer's password. Instances whose issuer password is stored as MD5 must reset it (or set `requireScram: false`).
+- New per-instance `statsRole` (optional): every temporary role on that instance also joins it, e.g. a role with `pg_read_all_stats` for query statistics. The issuer needs ADMIN on it. The temporary role's name hash now also covers its group roles, so turning it on never reuses a role created without it.
+
 ## v0.5.2
 
 - `pgauth serve` takes `accessHelp`, appended on one line to every no-binding denial: `no access to <instance>/<db> for <user>: no binding grants it. <accessHelp>`. Discovery publishes it as `access_help`.

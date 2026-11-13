@@ -33,13 +33,19 @@ psql "host=pgauth.example.com dbname=main/orders sslmode=verify-full" # password
    and the level picks the group roles: read joins `<db>_read`, write joins `<db>_read` and
    `<db>_write` (`groupRoles`). No access means no connection.
 5. pgauth creates or reuses the temporary role `pgauth_<sub8>_<hash6>`, where `hash6` covers the
-   subject, client, database and level. The role is a member of those group roles and of
-   `pgauth_temp`, carries `COMMENT ON ROLE` with the full subject, user, client and creation time, and
-   has a password only pgauth knows. It never gets `VALID UNTIL` ([ADR 0003](docs/adr/0003-drop-roles-not-valid-until.md)).
+   subject, client, database, level and group roles. The role is a member of those group roles, of
+   `pgauth_temp` and, when the instance sets `statsRole`, of that role, carries `COMMENT ON ROLE` with the full subject, user, client and creation time, and
+   has a password only pgauth knows, `CONNECTION LIMIT roleConnectionLimit` (20) and `VALID UNTIL` the
+   token's expiry plus 5 minutes, which only caps new logins
+   ([ADR 0003](docs/adr/0003-drop-roles-not-valid-until.md), [0012](docs/adr/0012-each-process-owns-its-roles.md)).
 6. pgauth logs in upstream as the role and splices the two connections. Access is checked only here,
    at connect ([ADR 0004](docs/adr/0004-check-at-the-gate-only.md)); `maxConnectionAge` (default 12h)
    bounds how long a connection lives.
-7. When the last connection using a role closes, pgauth drops the role.
+7. When the last connection using a role closes, pgauth removes it in an order the role cannot undo:
+   `NOLOGIN`, revoke its groups, terminate every session of it (including any it opened directly with
+   a password it set itself), `DROP ROLE`. A role that cannot be dropped (it created a large object or
+   default privileges) stays without login or rights, is logged and counted in
+   `pgauth.roles.drop_failed`, and is retried by the sweep.
 
 Cancel requests work: pgauth hands the client its own cancel key and forwards cancels upstream.
 
@@ -131,6 +137,16 @@ login holds none of the groups' rights itself, but it is optional: some tools (f
 OpenTofu Postgres providers) cannot express it, and plain `WITH ADMIN OPTION` works too. Temporary roles
 get rights only through the groups, so `DROP ROLE` needs no per-database cleanup.
 
+**Optional stats role.** With `statsRole: <role>` on an instance, every temporary role also joins
+that role, for example one that holds `pg_read_all_stats` for query statistics. Today everyone with any
+access gets it; it is one switch so it can later depend on a scope or binding.
+
+```sql
+CREATE ROLE pgauth_stats NOLOGIN;
+GRANT pg_read_all_stats TO pgauth_stats;   -- or whatever the stats should allow
+GRANT pgauth_stats TO pgauth WITH ADMIN OPTION;
+```
+
 **Optional hardening.** pgauth only ever connects a temporary role to the database its token names, so
 this is not needed for pgauth to be safe. If no other login relies on `PUBLIC` having `CONNECT`, you can
 also keep temporary roles out of other databases at the Postgres level:
@@ -167,14 +183,25 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
   switches one signal off. Every log line still goes to stdout as JSON as well, and the connect record
   carries the trace and span ids of its `pgauth.connect` span.
 
-### Multiple replicas
+### Replicas and the sweep
 
-Several pgauth pods can serve one instance. Each create, reuse and drop of a role runs under a
-Postgres advisory lock on the role name, and every pod derives the same password for a role from
-the shared issuer credential. A pod drops a role on its last local close only when `pg_stat_activity`
-shows no session of that role (another pod's); the startup sweep drops only `pgauth_temp` members
-with no session that were created more than `sweepMinAge` (5 minutes) ago. A role whose last session
-closed on a pod that then crashed stays until some pod restarts and sweeps it.
+Each pgauth process owns the roles it creates ([ADR 0012](docs/adr/0012-each-process-owns-its-roles.md)):
+their names and comments carry the process's nonce, and the process holds an advisory lock for it.
+Roles are never shared between processes. A role is handed out for half of `maxConnectionAge` and to
+at most `roleConnectionLimit` connections, then a new one is made; reusing a role resets its password.
+
+Every `sweepInterval` (1 minute) and at startup, pgauth removes members of `pgauth_temp` that this
+process no longer uses, whose owner's lock is gone, or that are older than 1.5 × `maxConnectionAge`
+plus 10 minutes. Several replicas are safe; a crashed replica's roles are removed by the next sweep
+of any other.
+
+Limits before and around authentication:
+
+- Messages before a token is accepted are capped at 64 KiB, and the handshake has 30 seconds.
+- `maxConnectionsPerUser` (50) caps one subject's open connections through one pgauth.
+- `requireScram` (per instance, default true) refuses any upstream password method but
+  SCRAM-SHA-256 before a password is sent, so a server posing as the instance never sees the issuer's
+  or a temporary role's password. Set it to false only for a server that cannot do SCRAM.
 
 ## Connecting as a person
 
