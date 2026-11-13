@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.3
+
+- New per-instance `statsRole` (optional): every temporary role on that instance also joins it, e.g. a role with `pg_read_all_stats` for query statistics. The issuer needs ADMIN on it. The temporary role's name hash now also covers its group roles, so turning it on never reuses a role created without it.
+
 ## v0.5.2
 
 - `pgauth serve` takes `accessHelp`, appended on one line to every no-binding denial: `no access to <instance>/<db> for <user>: no binding grants it. <accessHelp>`. Discovery publishes it as `access_help`.

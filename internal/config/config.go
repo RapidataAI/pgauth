@@ -97,6 +97,9 @@ type Instance struct {
 	Databases     []string `json:"databases"`
 	// CredentialsFile is a JSON file {"username": ..., "password": ...} for the issuer login.
 	CredentialsFile string `json:"credentialsFile"`
+	// StatsRole, when set, is joined by every temporary role on this instance (e.g. for query
+	// statistics); the issuer needs ADMIN on it.
+	StatsRole string `json:"statsRole"`
 }
 
 type Credentials struct {

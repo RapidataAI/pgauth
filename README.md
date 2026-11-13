@@ -33,8 +33,8 @@ psql "host=pgauth.example.com dbname=main/orders sslmode=verify-full" # password
    and the level picks the group roles: read joins `<db>_read`, write joins `<db>_read` and
    `<db>_write` (`groupRoles`). No access means no connection.
 5. pgauth creates or reuses the temporary role `pgauth_<sub8>_<hash6>`, where `hash6` covers the
-   subject, client, database and level. The role is a member of those group roles and of
-   `pgauth_temp`, carries `COMMENT ON ROLE` with the full subject, user, client and creation time, and
+   subject, client, database, level and group roles. The role is a member of those group roles, of
+   `pgauth_temp` and, when the instance sets `statsRole`, of that role, carries `COMMENT ON ROLE` with the full subject, user, client and creation time, and
    has a password only pgauth knows. It never gets `VALID UNTIL` ([ADR 0003](docs/adr/0003-drop-roles-not-valid-until.md)).
 6. pgauth logs in upstream as the role and splices the two connections. Access is checked only here,
    at connect ([ADR 0004](docs/adr/0004-check-at-the-gate-only.md)); `maxConnectionAge` (default 12h)
@@ -130,6 +130,16 @@ pgauth needs only `ADMIN` on the groups. `INHERIT FALSE, SET FALSE` is the recom
 login holds none of the groups' rights itself, but it is optional: some tools (for example Terraform /
 OpenTofu Postgres providers) cannot express it, and plain `WITH ADMIN OPTION` works too. Temporary roles
 get rights only through the groups, so `DROP ROLE` needs no per-database cleanup.
+
+**Optional stats role.** With `statsRole: <role>` on an instance, every temporary role also joins
+that role, for example one that holds `pg_read_all_stats` for query statistics. Today everyone with any
+access gets it; it is one switch so it can later depend on a scope or binding.
+
+```sql
+CREATE ROLE pgauth_stats NOLOGIN;
+GRANT pg_read_all_stats TO pgauth_stats;   -- or whatever the stats should allow
+GRANT pgauth_stats TO pgauth WITH ADMIN OPTION;
+```
 
 **Optional hardening.** pgauth only ever connects a temporary role to the database its token names, so
 this is not needed for pgauth to be safe. If no other login relies on `PUBLIC` having `CONNECT`, you can

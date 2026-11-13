@@ -46,4 +46,5 @@ instances:
     sslrootcert: /etc/pgauth/upstream-ca.pem
     adminDatabase: postgres
     databases: [orders, billing]
-    credentialsFile: /etc/pgauth/credentials/main.json   # {"username": "pgauth", "password": "..."}
+    credentialsFile: /etc/pgauth/credentials/main.json
+    # statsRole: pgauth_stats   # optional: every temporary role also joins it (e.g. for pg_stat_statements); the issuer needs ADMIN on it   # {"username": "pgauth", "password": "..."}

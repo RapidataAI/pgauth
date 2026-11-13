@@ -298,7 +298,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 
 	spec := roles.Spec{
 		Subject: claims.Subject, Username: claims.Username, ClientID: claims.ClientID,
-		Roles: []string{a.instance + "/" + a.db + ":" + d.level.String()}, Groups: d.groupRoles,
+		Roles: append([]string{a.instance + "/" + a.db + ":" + d.level.String()}, d.groupRoles...), Groups: d.groupRoles,
 	}
 	var upstream *pgconn.HijackedConn
 	role, pid, err := in.roles.Acquire(ctx, spec, func(role, password string) (uint32, error) {
@@ -373,6 +373,9 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 	d.groupRoles = []string{s.cfg.GroupRole("read", db)}
 	if d.level == rbac.Write {
 		d.groupRoles = append(d.groupRoles, s.cfg.GroupRole("write", db))
+	}
+	if in.cfg.StatsRole != "" {
+		d.groupRoles = append(d.groupRoles, in.cfg.StatsRole)
 	}
 	return in, d, ""
 }

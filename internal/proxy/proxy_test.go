@@ -56,6 +56,8 @@ var setupSQL = []string{
 	`CREATE ROLE pgauth LOGIN PASSWORD 'issuer-secret' CREATEROLE`,
 	`GRANT pg_signal_backend TO pgauth`,
 	`GRANT pgauth_temp TO pgauth WITH ADMIN OPTION`,
+	`CREATE ROLE pgauth_stats NOLOGIN`,
+	`GRANT pgauth_stats TO pgauth WITH ADMIN OPTION`,
 }
 
 func setupDatabaseSQL(db string) []string {
@@ -497,6 +499,34 @@ func TestAPI(t *testing.T) {
 			}
 			if strings.Join(entries, ",") != tt.want {
 				t.Fatalf("access = %v, want %s", entries, tt.want)
+			}
+		})
+	}
+}
+
+func TestStatsRole(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name      string
+		statsRole string
+		member    bool
+	}{
+		{"stats role set: temporary roles join it", "pgauth_stats", true},
+		{"stats role unset: they do not", "", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, _, _, _ := startServer(t, func(cfg *config.Config) { cfg.Instances[0].StatsRole = tt.statsRole })
+			conn, err := connect(ctx, addr, "cloudsql-main/order", claims{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close(ctx)
+			var member bool
+			if err := conn.QueryRow(ctx, "SELECT pg_has_role(current_user, 'pgauth_stats', 'MEMBER')").Scan(&member); err != nil {
+				t.Fatal(err)
+			}
+			if member != tt.member {
+				t.Fatalf("member of pgauth_stats = %v, want %v", member, tt.member)
 			}
 		})
 	}
