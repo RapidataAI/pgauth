@@ -36,7 +36,9 @@ groupRoles:
 tempGroup: pgauth_temp     # default
 rolePrefix: pgauth_        # default
 maxConnectionAge: 12h      # default
-sweepMinAge: 5m            # default; the startup sweep spares younger roles
+roleConnectionLimit: 20    # default: CONNECTION LIMIT of a temporary role, and connections sharing one
+maxConnectionsPerUser: 50  # default: open connections per subject through this pgauth
+sweepInterval: 1m          # default: how often leftover roles are removed
 
 instances:
   - name: main
@@ -47,4 +49,5 @@ instances:
     adminDatabase: postgres
     databases: [orders, billing]
     credentialsFile: /etc/pgauth/credentials/main.json
+    requireScram: true     # default: refuse any upstream auth but SCRAM-SHA-256 before sending a password
     # statsRole: pgauth_stats   # optional: every temporary role also joins it (e.g. for pg_stat_statements); the issuer needs ADMIN on it   # {"username": "pgauth", "password": "..."}

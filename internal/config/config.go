@@ -30,11 +30,17 @@ type Config struct {
 	// GroupRoles names the Postgres group role per access level; "{db}" is replaced by the database name.
 	GroupRoles GroupRoles `json:"groupRoles"`
 	// TempGroup marks every temporary role so pgauth can find and sweep them.
-	TempGroup        string     `json:"tempGroup"`
-	RolePrefix       string     `json:"rolePrefix"`
-	MaxConnectionAge Duration   `json:"maxConnectionAge"`
-	SweepMinAge      Duration   `json:"sweepMinAge"`
-	Instances        []Instance `json:"instances"`
+	TempGroup        string   `json:"tempGroup"`
+	RolePrefix       string   `json:"rolePrefix"`
+	MaxConnectionAge Duration `json:"maxConnectionAge"`
+	// SweepMinAge is ignored since v0.6.0; roles belong to the process that made them.
+	SweepMinAge   Duration `json:"sweepMinAge"`
+	SweepInterval Duration `json:"sweepInterval"`
+	// RoleConnectionLimit is each temporary role's CONNECTION LIMIT and how many connections share one.
+	RoleConnectionLimit int `json:"roleConnectionLimit"`
+	// MaxConnectionsPerUser caps one subject's open connections through this pgauth.
+	MaxConnectionsPerUser int        `json:"maxConnectionsPerUser"`
+	Instances             []Instance `json:"instances"`
 }
 
 type TLS struct {
@@ -100,6 +106,8 @@ type Instance struct {
 	// StatsRole, when set, is joined by every temporary role on this instance (e.g. for query
 	// statistics); the issuer needs ADMIN on it.
 	StatsRole string `json:"statsRole"`
+	// RequireScram refuses any upstream password method but SCRAM-SHA-256; nil means true.
+	RequireScram *bool `json:"requireScram"`
 }
 
 type Credentials struct {
@@ -176,8 +184,14 @@ func (c *Config) ApplyDefaults() {
 	if c.MaxConnectionAge == 0 {
 		c.MaxConnectionAge = Duration(12 * time.Hour)
 	}
-	if c.SweepMinAge == 0 {
-		c.SweepMinAge = Duration(5 * time.Minute)
+	if c.SweepInterval == 0 {
+		c.SweepInterval = Duration(time.Minute)
+	}
+	if c.RoleConnectionLimit == 0 {
+		c.RoleConnectionLimit = 20
+	}
+	if c.MaxConnectionsPerUser == 0 {
+		c.MaxConnectionsPerUser = 50
 	}
 	for i := range c.Instances {
 		in := &c.Instances[i]
@@ -253,6 +267,8 @@ func (c *Config) Databases() map[string][]string {
 	}
 	return out
 }
+
+func (in Instance) ScramOnly() bool { return in.RequireScram == nil || *in.RequireScram }
 
 func (in Instance) Serves(db string) bool { return slices.Contains(in.Databases, db) }
 

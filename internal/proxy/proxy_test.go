@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +30,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"go.opentelemetry.io/otel"
@@ -40,6 +43,7 @@ import (
 	"github.com/RapidataAI/pgauth/internal/config"
 	pgconnect "github.com/RapidataAI/pgauth/internal/connect"
 	"github.com/RapidataAI/pgauth/internal/rbac"
+	"github.com/RapidataAI/pgauth/internal/roles"
 	"github.com/RapidataAI/pgauth/internal/telemetry"
 	"github.com/RapidataAI/pgauth/internal/token"
 )
@@ -626,44 +630,376 @@ func TestReleaseDropsRole(t *testing.T) {
 	})
 }
 
+// TestSweep seeds roles the way pgauth processes would leave them and checks which a starting
+// pgauth removes: roles of dead owners, roles past any connection's life, roles without an owner.
 func TestSweep(t *testing.T) {
 	ctx := context.Background()
-	old := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
-	young := time.Now().UTC().Format(time.RFC3339)
 	issuerDSN := strings.Replace(shared.adminDSN, "postgres:postgres@", "pgauth:issuer-secret@", 1)
-	err := execAll(ctx, issuerDSN, []string{
-		`CREATE ROLE pgauth_old LOGIN IN ROLE pgauth_temp`,
-		`COMMENT ON ROLE pgauth_old IS '{"sub":"x","client":"y","created":"` + old + `"}'`,
-		`CREATE ROLE pgauth_young LOGIN IN ROLE pgauth_temp`,
-		`COMMENT ON ROLE pgauth_young IS '{"sub":"x","client":"y","created":"` + young + `"}'`,
-		`CREATE ROLE pgauth_busy LOGIN PASSWORD 'busy' IN ROLE pgauth_temp, order_read`,
-		`COMMENT ON ROLE pgauth_busy IS '{"sub":"x","client":"y","created":"` + old + `"}'`,
-	})
+	// A live owner: this test holds the lock another pgauth process would.
+	owner, err := pgx.Connect(ctx, shared.adminDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = execAll(ctx, shared.adminDSN, []string{`CREATE ROLE pgauth_unmarked LOGIN`})
-	if err != nil {
+	defer owner.Close(ctx)
+	class, key := roles.OwnerLock("alive1")
+	if _, err := owner.Exec(ctx, "SELECT pg_advisory_lock($1, $2)", class, key); err != nil {
 		t.Fatal(err)
 	}
-	busy, err := pgx.Connect(ctx, strings.Replace(strings.Replace(shared.adminDSN, "postgres:postgres@", "pgauth_busy:busy@", 1), "/postgres?", "/order?", 1))
-	if err != nil {
+	now, old := time.Now().UTC().Format(time.RFC3339), time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339)
+	tests := []struct {
+		role, comment string
+		session       bool
+		removed       bool
+	}{
+		{"pgauth_dead_owner", `{"pod":"dead01","created":"` + now + `"}`, true, true},
+		{"pgauth_live_owner", `{"pod":"alive1","created":"` + now + `"}`, false, false},
+		{"pgauth_live_but_too_old", `{"pod":"alive1","created":"` + old + `"}`, false, true},
+		{"pgauth_from_v05", `{"sub":"x","client":"y","created":"` + now + `"}`, false, true},
+	}
+	for _, tt := range tests {
+		err := execAll(ctx, issuerDSN, []string{
+			fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'pw' IN ROLE pgauth_temp, order_read`, tt.role),
+			fmt.Sprintf(`COMMENT ON ROLE %s IS '%s'`, tt.role, tt.comment),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := execAll(ctx, shared.adminDSN, []string{`CREATE ROLE pgauth_unmarked LOGIN`}); err != nil {
 		t.Fatal(err)
 	}
-	startServer(t, nil)
-	busy.Close(ctx)
+	defer func() {
+		_ = execAll(ctx, shared.adminDSN, []string{`DROP ROLE IF EXISTS pgauth_unmarked`, `DROP ROLE IF EXISTS pgauth_live_owner`})
+	}()
+	sessions := map[string]*pgx.Conn{}
+	for _, tt := range tests {
+		if tt.session {
+			c, err := pgx.Connect(ctx, directDSN(tt.role, "pw", "order"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close(ctx)
+			sessions[tt.role] = c
+		}
+	}
 
-	rows, _ := pgx.Connect(ctx, shared.adminDSN)
-	defer rows.Close(ctx)
-	r, _ := rows.Query(ctx, `SELECT rolname FROM pg_roles WHERE rolname IN ('pgauth_old', 'pgauth_young', 'pgauth_busy', 'pgauth_unmarked') ORDER BY 1`)
-	left, err := pgx.CollectRows(r, pgx.RowTo[string])
+	startServer(t, nil)
+
+	for _, tt := range tests {
+		t.Run(tt.role, func(t *testing.T) {
+			exists, _ := roleState(t, tt.role)
+			if exists == tt.removed {
+				t.Fatalf("role exists = %v, want removed = %v", exists, tt.removed)
+			}
+			if c := sessions[tt.role]; c != nil && tt.removed {
+				if _, err := c.Exec(ctx, "SELECT 1"); err == nil {
+					t.Fatal("the removed role's session still runs")
+				}
+			}
+		})
+	}
+	if exists, _ := roleState(t, "pgauth_unmarked"); !exists {
+		t.Fatal("a role outside pgauth_temp was removed")
+	}
+}
+
+func directDSN(role, password, db string) string {
+	dsn := strings.Replace(shared.adminDSN, "postgres:postgres@", role+":"+password+"@", 1)
+	return strings.Replace(dsn, "/postgres?", "/"+db+"?", 1)
+}
+
+func roleState(t *testing.T, role string) (exists bool, canLogin bool) {
+	t.Helper()
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, shared.adminDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "pgauth_busy pgauth_unmarked pgauth_young"; strings.Join(left, " ") != want {
-		t.Fatalf("roles left = %v, want %s", left, want)
+	defer admin.Close(ctx)
+	err = admin.QueryRow(ctx, `SELECT true, rolcanlogin FROM pg_roles WHERE rolname = $1`, role).Scan(&exists, &canLogin)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false
 	}
-	_ = execAll(ctx, shared.adminDSN, []string{`DROP ROLE pgauth_busy`, `DROP ROLE pgauth_young`, `DROP ROLE pgauth_unmarked`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exists, canLogin
+}
+
+// dropAsSuperuser removes a role pgauth had to leave behind, with whatever it owns.
+func dropAsSuperuser(t *testing.T, role string) {
+	ctx := context.Background()
+	for _, db := range []string{"order", "assignment", "postgres"} {
+		_ = execAll(ctx, strings.Replace(shared.adminDSN, "/postgres?", "/"+db+"?", 1), []string{fmt.Sprintf(`DROP OWNED BY %q`, role)})
+	}
+	_ = execAll(ctx, shared.adminDSN, []string{fmt.Sprintf(`DROP ROLE IF EXISTS %q`, role)})
+}
+
+// TestRevocation turns the security audit's probes into rows: a temporary role sets its own
+// password or makes itself undroppable, and must still end with no way in once its last pgauth
+// connection closes.
+func TestRevocation(t *testing.T) {
+	ctx := context.Background()
+	addr, _, _, _ := startServer(t, nil)
+	tests := []struct {
+		name string
+		stmt string // run by the temporary role before it changes its own password
+	}{
+		{"own password, direct session", ""},
+		{"large object keeps the role", "SELECT lo_create(0)"},
+		{"default privileges keep the role", "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn, err := connect(ctx, addr, "cloudsql-main/order", claims{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var role string
+			if err := conn.QueryRow(ctx, "SELECT current_user").Scan(&role); err != nil {
+				t.Fatal(err)
+			}
+			defer dropAsSuperuser(t, role)
+			if tt.stmt != "" {
+				if _, err := conn.Exec(ctx, tt.stmt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := conn.Exec(ctx, fmt.Sprintf(`ALTER ROLE %q PASSWORD 'mine'`, role)); err != nil {
+				t.Fatal(err)
+			}
+			direct, err := pgx.Connect(ctx, directDSN(role, "mine", "order"))
+			if err != nil {
+				t.Fatalf("direct login while the pgauth connection is open: %v", err)
+			}
+			defer direct.Close(ctx)
+
+			conn.Close(ctx)
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				exists, canLogin := roleState(t, role)
+				if !exists || !canLogin {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("role can still log in after its last pgauth connection closed")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if _, err := direct.Exec(ctx, "SELECT count(*) FROM items"); err == nil {
+				t.Fatal("the direct session survived the last close")
+			}
+			if c, err := pgx.Connect(ctx, directDSN(role, "mine", "order")); err == nil {
+				c.Close(ctx)
+				t.Fatal("a new direct login works after the last close")
+			}
+			if exists, _ := roleState(t, role); exists {
+				var groups int
+				admin, _ := pgx.Connect(ctx, shared.adminDSN)
+				defer admin.Close(ctx)
+				_ = admin.QueryRow(ctx, `SELECT count(*) FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.member
+					JOIN pg_roles g ON g.oid = am.roleid WHERE r.rolname = $1 AND g.rolname <> 'pgauth_temp'`, role).Scan(&groups)
+				if groups != 0 {
+					t.Fatalf("a role pgauth could not drop still holds %d groups", groups)
+				}
+			}
+		})
+	}
+
+	t.Run("reuse resets a self-set password", func(t *testing.T) {
+		a, err := connect(ctx, addr, "cloudsql-main/order", claims{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer a.Close(ctx)
+		var role string
+		_ = a.QueryRow(ctx, "SELECT current_user").Scan(&role)
+		if _, err := a.Exec(ctx, fmt.Sprintf(`ALTER ROLE %q PASSWORD 'mine'`, role)); err != nil {
+			t.Fatal(err)
+		}
+		b, err := connect(ctx, addr, "cloudsql-main/order", claims{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Close(ctx)
+		if c, err := pgx.Connect(ctx, directDSN(role, "mine", "order")); err == nil {
+			c.Close(ctx)
+			t.Fatal("the self-set password still works after pgauth reused the role")
+		}
+	})
+}
+
+func TestCaps(t *testing.T) {
+	ctx := context.Background()
+	open := func(t *testing.T, addr string, n int) (conns []*pgx.Conn, roles map[string]bool, err error) {
+		roles = map[string]bool{}
+		for range n {
+			c, err := connect(ctx, addr, "cloudsql-main/order", claims{})
+			if err != nil {
+				return conns, roles, err
+			}
+			t.Cleanup(func() { c.Close(ctx) })
+			var role string
+			_ = c.QueryRow(ctx, "SELECT current_user").Scan(&role)
+			conns, roles[role] = append(conns, c), true
+		}
+		return conns, roles, nil
+	}
+
+	t.Run("role connection limit: a full role is not shared further", func(t *testing.T) {
+		addr, _, _, _ := startServer(t, func(cfg *config.Config) { cfg.RoleConnectionLimit = 2 })
+		_, roleNames, err := open(t, addr, 3)
+		if err != nil || len(roleNames) != 2 {
+			t.Fatalf("3 connections used roles %v, err %v; want 2 roles", roleNames, err)
+		}
+		for role := range roleNames {
+			var limit int
+			var validUntil time.Time
+			admin, _ := pgx.Connect(ctx, shared.adminDSN)
+			defer admin.Close(ctx)
+			if err := admin.QueryRow(ctx, "SELECT rolconnlimit, rolvaliduntil FROM pg_roles WHERE rolname = $1", role).Scan(&limit, &validUntil); err != nil {
+				t.Fatal(err)
+			}
+			// The test token expires in 15 minutes; VALID UNTIL adds 5.
+			if limit != 2 || time.Until(validUntil) < 19*time.Minute || time.Until(validUntil) > 21*time.Minute {
+				t.Fatalf("%s: CONNECTION LIMIT %d, VALID UNTIL in %s", role, limit, time.Until(validUntil).Round(time.Second))
+			}
+		}
+	})
+
+	t.Run("connections per user", func(t *testing.T) {
+		addr, _, _, _ := startServer(t, func(cfg *config.Config) { cfg.MaxConnectionsPerUser = 2 })
+		_, _, err := open(t, addr, 3)
+		if err == nil || !strings.Contains(err.Error(), "too many connections for mari@example.com (limit 2) (SQLSTATE 53300)") {
+			t.Fatalf("third connection: %v", err)
+		}
+	})
+}
+
+func rssMB(t *testing.T) int {
+	t.Helper()
+	b, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		t.Skip("no /proc/self/statm")
+	}
+	pages, _ := strconv.Atoi(strings.Fields(string(b))[1])
+	return pages * os.Getpagesize() >> 20
+}
+
+// TestPreAuthLimits sends what the audit sent before any token: a message claiming a huge length.
+// pgauth must close the connection instead of buffering it.
+func TestPreAuthLimits(t *testing.T) {
+	addr, _, _, _ := startServer(t, nil)
+	tests := []struct {
+		name    string
+		header  func(conn net.Conn) error // brings the conversation to where the message is sent
+		message []byte
+	}{
+		{"password message of 1 GiB", func(conn net.Conn) error {
+			startup, _ := (&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": "x", "database": "cloudsql-main/order"}}).Encode(nil)
+			if _, err := conn.Write(startup); err != nil {
+				return err
+			}
+			_, err := io.ReadFull(conn, make([]byte, 9)) // AuthenticationCleartextPassword
+			return err
+		}, []byte{'p', 0x40, 0, 0, 0}},
+		{"startup message of 1 GiB", func(net.Conn) error { return nil }, []byte{0x40, 0, 0, 0, 0, 3, 0, 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			ssl, _ := (&pgproto3.SSLRequest{}).Encode(nil)
+			resp := make([]byte, 1)
+			if _, err := raw.Write(ssl); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(raw, resp); err != nil {
+				t.Fatal(err)
+			}
+			conn := tls.Client(raw, &tls.Config{InsecureSkipVerify: true})
+			if err := tt.header(conn); err != nil {
+				t.Fatal(err)
+			}
+			before := rssMB(t)
+			if _, err := conn.Write(tt.message); err != nil {
+				t.Fatal(err)
+			}
+			chunk := make([]byte, 1<<20)
+			sent := 0
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			for ; sent < 200; sent++ {
+				if _, err := conn.Write(chunk); err != nil {
+					break
+				}
+			}
+			if sent == 200 {
+				t.Fatal("pgauth kept reading a 1 GiB message before authentication")
+			}
+			if grown := rssMB(t) - before; grown > 32 {
+				t.Fatalf("memory grew by %d MiB", grown)
+			}
+		})
+	}
+}
+
+// TestRequireScram plays an upstream that asks for a password method and records whether pgauth
+// answers with the issuer's password.
+func TestRequireScram(t *testing.T) {
+	no := false
+	tests := []struct {
+		name         string
+		auth         pgproto3.BackendMessage
+		requireScram *bool
+		refused      bool // pgauth refuses before answering
+		sendsSecret  bool // the secret password reached the server
+	}{
+		{"cleartext refused", &pgproto3.AuthenticationCleartextPassword{}, nil, true, false},
+		{"md5 refused", &pgproto3.AuthenticationMD5Password{Salt: [4]byte{1, 2, 3, 4}}, nil, true, false},
+		{"SCRAM proceeds", &pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}}, nil, false, false},
+		{"cleartext allowed when requireScram is off", &pgproto3.AuthenticationCleartextPassword{}, &no, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			got := make(chan []byte, 1)
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				b := pgproto3.NewBackend(c, c)
+				if _, err := b.ReceiveStartupMessage(); err != nil {
+					return
+				}
+				b.Send(tt.auth)
+				_ = b.Flush()
+				_ = c.SetReadDeadline(time.Now().Add(time.Second))
+				all, _ := io.ReadAll(c)
+				got <- all
+			}()
+			_, port, _ := net.SplitHostPort(ln.Addr().String())
+			p, _ := strconv.Atoi(port)
+			in := config.Instance{Host: "127.0.0.1", Port: p, SSLMode: "disable", RequireScram: tt.requireScram}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, err = (&Server{}).dial(ctx, in, "pgauth", "issuer-secret", "postgres", nil)
+			if refused := err != nil && strings.Contains(err.Error(), "requireScram"); refused != tt.refused {
+				t.Fatalf("refused = %v (err %v), want %v", refused, err, tt.refused)
+			}
+			if sent := strings.Contains(string(<-got), "issuer-secret"); sent != tt.sendsSecret {
+				t.Fatalf("secret sent = %v, want %v", sent, tt.sendsSecret)
+			}
+		})
+	}
 }
 
 type memStore map[string]string

@@ -74,6 +74,7 @@ func (f *forwarder) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Minute))
 	backend := pgproto3.NewBackend(conn, conn)
+	backend.SetMaxBodyLen(64 << 10)
 	var startup *pgproto3.StartupMessage
 	for startup == nil {
 		msg, err := backend.ReceiveStartupMessage()
