@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"text/tabwriter"
 
-	"github.com/RapidataAI/pgauth/internal/api"
 	"github.com/RapidataAI/pgauth/internal/connect"
 )
 
@@ -224,30 +223,7 @@ func lsCmd(args []string) error {
 }
 
 func printAccess(ctx context.Context, router *connect.Router, names []string) error {
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "DATABASE\tLEVEL")
-	failed := false
-	for _, name := range names {
-		e, _ := router.Env(name)
-		d, err := e.Discovery(ctx)
-		var access []api.Access
-		if err == nil {
-			access, err = e.Access(ctx)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
-			failed = true
-			continue
-		}
-		for _, a := range access {
-			fmt.Fprintf(w, "%s\t%s\n", e.Address(d, a.Instance, a.Database), a.Level)
-		}
-	}
-	_ = w.Flush()
-	if failed {
-		return fmt.Errorf("some environments could not be listed")
-	}
-	return nil
+	return router.PrintAccess(ctx, os.Stdout, os.Stderr, names)
 }
 
 func envCmd(args []string) error {

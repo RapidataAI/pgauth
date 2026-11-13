@@ -215,8 +215,10 @@ one per environment) or from a file that something else keeps fresh (`token: {fi
 statusFile}`, re-read on every connection). The connector never runs a command
 ([ADR 0009](docs/adr/0009-tokens-from-login-or-file.md)). A missing, unreadable or expired token file
 fails only that connection, with `FATAL 28000` carrying the status file's text (or the path); the next
-connection reads the file again. A database without a binding fails with
-`no access to prod/payment: no binding grants it`.
+connection reads the file again. A database without a binding fails with serve's own text, passed through unchanged:
+`no access to cloudsql-main/payment for luca@example.com: no binding grants it. <accessHelp>`, where
+the server's `accessHelp` says where to ask for access. `pgauth ls` shows the same help when nothing is
+reachable.
 
 Any process of yours that can reach the local port connects with your rights, the same trade-off as
 other local database proxies.

@@ -366,7 +366,7 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 	d.level = min(d.granted, d.scopeCap)
 	switch {
 	case d.granted == rbac.None:
-		return nil, d, fmt.Sprintf("no role binding grants %s access to %s/%s", claims.Username, instName, db)
+		return nil, d, denial(instName, db, claims.Username, s.cfg.AccessHelp)
 	case d.scopeCap == rbac.None:
 		return nil, d, fmt.Sprintf("token has neither the %s nor the %s scope", s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)
 	}
@@ -375,6 +375,15 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 		d.groupRoles = append(d.groupRoles, s.cfg.GroupRole("write", db))
 	}
 	return in, d, ""
+}
+
+// denial is the one-line reason a holder without a binding is refused, with where to ask for access.
+func denial(instance, db, user, help string) string {
+	msg := fmt.Sprintf("no access to %s/%s for %s: no binding grants it.", instance, db, user)
+	if help = strings.Join(strings.Fields(help), " "); help != "" {
+		msg += " " + help
+	}
+	return msg
 }
 
 func (s *Server) dial(ctx context.Context, in config.Instance, role, password, db string, params map[string]string) (*pgconn.HijackedConn, error) {

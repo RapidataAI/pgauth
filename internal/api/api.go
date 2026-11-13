@@ -22,6 +22,8 @@ type Discovery struct {
 	CLIClientID string     `json:"cli_client_id"`
 	Scopes      Scopes     `json:"scopes"`
 	Instances   []Instance `json:"instances"`
+	// AccessHelp says where to ask for access; empty when the server sets none.
+	AccessHelp string `json:"access_help,omitempty"`
 }
 
 type Scopes struct {
@@ -65,6 +67,7 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 		Audience:    s.cfg.OIDC.Audience,
 		CLIClientID: s.cfg.Discovery.CLIClientID,
 		Scopes:      Scopes{Read: s.cfg.OIDC.Scopes.Read, Write: s.cfg.OIDC.Scopes.Write},
+		AccessHelp:  s.cfg.AccessHelp,
 	}
 	if d.Postgres == "" {
 		host, _, err := net.SplitHostPort(r.Host)

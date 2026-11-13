@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.2
+
+- `pgauth serve` takes `accessHelp`, appended on one line to every no-binding denial: `no access to <instance>/<db> for <user>: no binding grants it. <accessHelp>`. Discovery publishes it as `access_help`.
+- `pgauth connect` passes serve's denial through unchanged on every port (it no longer rewrites it), and `pgauth ls` prints the access help for an environment where nothing is reachable.
+
 ## v0.5.1
 
 - `pgauth connect` looks up `<env>/<db>` with a 3 s timeout, keeps the last discovery per environment on disk (user cache directory, else next to the config) and uses it while the API is down. With no answer at all, the error says what to do: `pgauth api <url> unreachable (<cause>); use <env>/<instance>/<db> to connect without it`.
